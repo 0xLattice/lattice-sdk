@@ -25,9 +25,9 @@
     "test:e2e": "npm run build && tsx --test test/e2e/*.e2e.ts"
   },
   "devDependencies": {
-    "@types/node": "^24.7.0",
+    "@types/node": "^26.6.4",
     "prettier": "^3.6.2",
     "tsx": "^4.20.6",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   }
 }
