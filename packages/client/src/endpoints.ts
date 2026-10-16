@@ -440,6 +440,7 @@ export class EndpointResolver {
     let resolved: ResolvedEndpoint[] = [];
     for (let depth = rootPath.length + 1; depth <= chainPath.length; depth += 1) {
       resolved = await this.#level(sources, chainPath.slice(0, depth), network, budget, signal);
+      signal?.throwIfAborted();
       if (resolved.length === 0) return [];
       sources = resolved.map((entry) => entry.url);
     }
