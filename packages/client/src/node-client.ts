@@ -165,13 +165,17 @@ export class NodeClient {
    * on the last. The node's list only grows: a directory committed on a
    * branch that lost stays listed. A child is reached through its hosts, not
    * through what the parent commits. A node predating paging answers its
-   * whole list; names not after `after` are dropped from it.
+   * whole list; names not after `after` are dropped from it. A page whose
+   * `next` does not move past `after` is refused.
    */
   childDirectories(
-    options: { readonly after?: string } = {},
+    options: { readonly after?: string; readonly limit?: number } = {},
     signal?: AbortSignal,
   ): Promise<ChildDirectoriesPage> {
-    const { after } = options;
+    const { after, limit } = options;
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) {
+      throw new RangeError("limit must be a positive integer");
+    }
     return this.#request(
       "/api/chain/children",
       (value) => {
@@ -189,10 +193,16 @@ export class NodeClient {
         if (next !== undefined && next !== listed.at(-1)) {
           throw new TypeError("chainChildren.next must be the last name listed");
         }
+        if (next !== undefined && directories.length === 0) {
+          throw new TypeError("chainChildren.next does not advance past after");
+        }
         return { directories, ...(next === undefined ? {} : { next }) };
       },
       signal,
-      after === undefined ? {} : { after },
+      {
+        ...(after === undefined ? {} : { after }),
+        ...(limit === undefined ? {} : { limit: limit.toString() }),
+      },
     ) as Promise<ChildDirectoriesPage>;
   }
 

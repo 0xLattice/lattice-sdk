@@ -1,4 +1,4 @@
-import { getJSON } from "./http.js";
+import { NodeError, getJSON } from "./http.js";
 import {
   type ChildDirectoriesPage,
   type Fetch,
@@ -198,6 +198,15 @@ function samePath(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((part, index) => part === right[index]);
 }
 
+/** Names asked for per directory page: the node's cap. */
+const DIRECTORY_PAGE = 200;
+
+/**
+ * Room for a page of one directory name: a name is at most 65,535 bytes of
+ * printable ASCII, which JSON escaping at most doubles.
+ */
+const LONGEST_NAME_PAGE_BYTES = 2 * 65_535 + 4_096;
+
 /** Requests one {@link EndpointResolver.resolve} may still make. */
 class Budget {
   remaining: number;
@@ -249,14 +258,19 @@ export class EndpointResolver {
     this.#maximumRequests = options.maximumRequests ?? 64;
   }
 
-  #client(baseURL: string, chainPath: readonly string[], budget: Budget): NodeClient {
+  #client(
+    baseURL: string,
+    chainPath: readonly string[],
+    budget: Budget,
+    maximumResponseBytes = this.#maximumResponseBytes,
+  ): NodeClient {
     return new NodeClient(baseURL, chainPath, {
       fetch: (input, init) => {
         budget.spend();
         return this.#fetch(input, init);
       },
       timeoutMilliseconds: this.#timeoutMilliseconds,
-      maximumResponseBytes: this.#maximumResponseBytes,
+      maximumResponseBytes,
     });
   }
 
@@ -452,7 +466,9 @@ export class EndpointResolver {
 
   /**
    * Every child directory the first answering source lists, page by page. A
-   * source that fails mid-list hands over to the next, from the last name read.
+   * page over the response cap is asked again with half the names, down to
+   * one; one name alone may take {@link LONGEST_NAME_PAGE_BYTES}. A source
+   * that fails mid-list hands over to the next, from the last name read.
    */
   async *#childDirectories(
     sources: readonly string[],
@@ -463,12 +479,25 @@ export class EndpointResolver {
     let after: string | undefined;
     for (const source of sources.slice(0, this.#maximumSources)) {
       const client = this.#client(source, chainPath, budget);
+      const single = this.#client(
+        source,
+        chainPath,
+        budget,
+        Math.max(this.#maximumResponseBytes, LONGEST_NAME_PAGE_BYTES),
+      );
+      let limit = DIRECTORY_PAGE;
       let page: ChildDirectoriesPage;
       for (;;) {
         try {
-          page = await client.childDirectories(after === undefined ? {} : { after }, signal);
-        } catch {
+          const options = { limit, ...(after === undefined ? {} : { after }) };
+          page = await (limit === 1 ? single : client).childDirectories(options, signal);
+          limit = DIRECTORY_PAGE;
+        } catch (error) {
           signal?.throwIfAborted();
+          if (limit > 1 && error instanceof NodeError && error.refusal === "response too large") {
+            limit = Math.max(1, Math.floor(limit / 2));
+            continue;
+          }
           break;
         }
         for (const directory of page.directories) {

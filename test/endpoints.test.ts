@@ -71,7 +71,7 @@ const liveRoutes: Routes = {
   [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
   [`${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`]: fixture("read-endpoints-testnet.json"),
   ...serving(FOLLOWER, ["Nexus", "testnet"]),
-  [`${READ}/api/chain/children?chainPath=Nexus`]: JSON.stringify({
+  [`${READ}/api/chain/children?chainPath=Nexus&limit=200`]: JSON.stringify({
     chainPath: ["Nexus"],
     directories: ["testnet"],
   }),
@@ -191,19 +191,20 @@ test("a source failing mid-list hands over to the next from the last name read",
       ...declaring(READ, ["Nexus", "A"], ["https://s1.example.org", "https://s2.example.org"]),
       ...serving("https://s1.example.org", ["Nexus", "A"]),
       ...serving("https://s2.example.org", ["Nexus", "A"]),
-      [`${READ}/api/chain/children?chainPath=Nexus`]: JSON.stringify({
+      [`${READ}/api/chain/children?chainPath=Nexus&limit=200`]: JSON.stringify({
         chainPath: ["Nexus"],
         directories: ["A"],
       }),
-      [`https://s1.example.org/api/chain/children?chainPath=Nexus%2FA`]: JSON.stringify({
+      [`https://s1.example.org/api/chain/children?chainPath=Nexus%2FA&limit=200`]: JSON.stringify({
         chainPath: ["Nexus", "A"],
         directories: ["b"],
         next: "b",
       }),
-      [`https://s2.example.org/api/chain/children?chainPath=Nexus%2FA&after=b`]: JSON.stringify({
-        chainPath: ["Nexus", "A"],
-        directories: ["c"],
-      }),
+      [`https://s2.example.org/api/chain/children?chainPath=Nexus%2FA&after=b&limit=200`]:
+        JSON.stringify({
+          chainPath: ["Nexus", "A"],
+          directories: ["c"],
+        }),
     },
     dialed,
   );
@@ -612,4 +613,107 @@ test("a directory page must be in order and continue from its last name", async 
   assert.deepEqual(await page({ directories: ["a", "b", "c"] }).childDirectories({ after: "b" }), {
     directories: ["c"],
   });
+});
+
+test("a source whose next never advances is left for the next source", async () => {
+  const fetch = network({
+    [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
+    [`${READ}/api/chain/children?chainPath=Nexus&limit=200`]: JSON.stringify({
+      chainPath: ["Nexus"],
+      directories: ["a"],
+      next: "a",
+    }),
+    // Ignores `after`: the same page again.
+    [`${READ}/api/chain/children?chainPath=Nexus&after=a&limit=200`]: JSON.stringify({
+      chainPath: ["Nexus"],
+      directories: ["a"],
+      next: "a",
+    }),
+  });
+  const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
+  assert.deepEqual(await all(resolver.walk()), []);
+  await assert.rejects(
+    new NodeClient(READ, ["Nexus"], { fetch }).childDirectories({ after: "a", limit: 200 }),
+    /does not advance/,
+  );
+});
+
+test("a page over the response cap is asked again smaller, and one long name still fits", async () => {
+  const long = `x${"y".repeat(60_000)}`;
+  const names = ["a", "b", long, "z"];
+  const asked: string[] = [];
+  const fetch = async (input: string | URL): Promise<Response> => {
+    const url = new URL(input);
+    const path = (url.searchParams.get("chainPath") ?? "").split("/");
+    if (url.pathname === "/api/chain/genesis") {
+      return new Response(JSON.stringify({ genesisHash: NEXUS }));
+    }
+    if (url.pathname === "/api/chain/children" && path.length === 1) {
+      const after = url.searchParams.get("after");
+      const limit = Number(url.searchParams.get("limit"));
+      asked.push(`${limit}:${(after ?? "").slice(0, 1)}`);
+      const rest = names.filter((name) => after === null || name > after);
+      const page = rest.slice(0, limit);
+      return new Response(
+        JSON.stringify({
+          chainPath: path,
+          directories: page,
+          ...(rest.length > limit ? { next: page.at(-1) } : {}),
+        }),
+      );
+    }
+    if (url.pathname === "/api/chain/children") {
+      return new Response(JSON.stringify({ chainPath: path, directories: [] }));
+    }
+    if (url.pathname === "/api/chain/endpoints") {
+      return new Response(
+        JSON.stringify({
+          chainPath: path,
+          committedBlock: null,
+          endpoints: ["https://h.example.org"],
+          submitEndpoints: [],
+        }),
+      );
+    }
+    return new Response(JSON.stringify({ chain: path, height: "1" }));
+  };
+  const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), {
+    fetch,
+    maximumResponseBytes: 16 * 1024,
+  });
+  const found = await all(resolver.walk());
+  // The long-named chain is listed, and the walk goes on past it; its own
+  // answers repeat its name and so exceed this test's small cap.
+  assert.deepEqual(
+    found.map((entry) => entry.chainPath[1]!.slice(0, 1)),
+    ["a", "b", "z"],
+  );
+  // Whole list too big; halved to 1, where the long name fits; then back to 200 after it.
+  assert.deepEqual(asked, [
+    "200:",
+    "100:",
+    "50:",
+    "25:",
+    "12:",
+    "6:",
+    "3:",
+    "1:",
+    "200:a",
+    "100:a",
+    "50:a",
+    "25:a",
+    "12:a",
+    "6:a",
+    "3:a",
+    "1:a",
+    "200:b",
+    "100:b",
+    "50:b",
+    "25:b",
+    "12:b",
+    "6:b",
+    "3:b",
+    "1:b",
+    "200:x",
+  ]);
 });
