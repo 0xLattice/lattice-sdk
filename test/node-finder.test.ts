@@ -131,7 +131,7 @@ test("concurrent reads share one search; a found node is searched again when for
   assert.equal(searches(), 3);
 });
 
-test("the start node is never a found node, and is never marked failed", async () => {
+test("the start node is never returned as a found node", async () => {
   const finder = new ChainNodeFinder(START, {
     fetch: network({ [START]: ["N"] }, () => ({ "N/x": [START] })),
   });

@@ -120,7 +120,10 @@ export class ChainNodeFinder {
     let at = chainPath.slice(0, -1);
     while (at.length > 0 && !(await this.serves(start, at))) at = at.slice(0, -1);
     if (at.length === 0) {
-      if (startServes) return itself;
+      if (startServes) {
+        entry.until = this.#now() + this.#ttl;
+        return itself;
+      }
       throw new ChainOfflineError(chainPath);
     }
     const resolver = new EndpointResolver(new NodeClient(start, at, { fetch: this.#fetch }), {
@@ -131,7 +134,11 @@ export class ChainNodeFinder {
       .map(({ url }) => url)
       .filter((url) => url !== start);
     const url = hosts.find(fresh) ?? hosts[0];
-    if (url === undefined && startServes) return itself;
+    if (url === undefined && startServes) {
+      // The start node again, for now: hosts declared later are looked for after the ttl.
+      entry.until = this.#now() + this.#ttl;
+      return itself;
+    }
     if (url === undefined) {
       // Nothing found. If the start node's own part of the walk failed (its
       // network, or its directory for the first level), that is its failure,
