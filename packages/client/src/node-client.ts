@@ -19,7 +19,14 @@ import {
 import { type Fetch, getJSON } from "./http.js";
 
 export { type Fetch, NodeError } from "./http.js";
-import { integer, record, string, stringArray } from "./wire.js";
+import { integer, optionalString, record, string, stringArray } from "./wire.js";
+
+/** A page of {@link NodeClient.childDirectories}. */
+export interface ChildDirectoriesPage {
+  readonly directories: readonly string[];
+  /** The `after` for the following page; absent on the last. */
+  readonly next?: string;
+}
 
 export interface NodeClientOptions {
   readonly fetch?: Fetch;
@@ -152,12 +159,19 @@ export class NodeClient {
   }
 
   /**
-   * The child directories this chain's executed blocks have committed
-   * (`GET /api/chain/children`). The node's list only grows: a directory
-   * committed on a branch that lost stays listed. A child is reached through
-   * its hosts, not through what the parent commits.
+   * One page of the child directories this chain's executed blocks have
+   * committed (`GET /api/chain/children`), in order, after `after` (from the
+   * first when absent). `next` is the `after` for the following page, absent
+   * on the last. The node's list only grows: a directory committed on a
+   * branch that lost stays listed. A child is reached through its hosts, not
+   * through what the parent commits. A node predating paging answers its
+   * whole list; names not after `after` are dropped from it.
    */
-  childDirectories(signal?: AbortSignal): Promise<string[]> {
+  childDirectories(
+    options: { readonly after?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<ChildDirectoriesPage> {
+    const { after } = options;
     return this.#request(
       "/api/chain/children",
       (value) => {
@@ -166,10 +180,20 @@ export class NodeClient {
         if (chainPath.join("/") !== this.chainPath.join("/")) {
           throw new TypeError("chain children answer names a different chainPath");
         }
-        return stringArray(body.directories, "chainChildren.directories");
+        const listed = stringArray(body.directories, "chainChildren.directories");
+        if (listed.some((name, index) => index > 0 && !(listed[index - 1]! < name))) {
+          throw new TypeError("chain children are not in order");
+        }
+        const directories = after === undefined ? listed : listed.filter((name) => name > after);
+        const next = optionalString(body.next, "chainChildren.next");
+        if (next !== undefined && next !== listed.at(-1)) {
+          throw new TypeError("chainChildren.next must be the last name listed");
+        }
+        return { directories, ...(next === undefined ? {} : { next }) };
       },
       signal,
-    ) as Promise<string[]>;
+      after === undefined ? {} : { after },
+    ) as Promise<ChildDirectoriesPage>;
   }
 
   /** The node's Nexus genesis (`GET /api/chain/genesis`): which network it is on. */

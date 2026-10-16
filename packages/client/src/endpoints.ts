@@ -1,5 +1,10 @@
 import { getJSON } from "./http.js";
-import { type Fetch, NodeClient, normalizeNodeURL } from "./node-client.js";
+import {
+  type ChildDirectoriesPage,
+  type Fetch,
+  NodeClient,
+  normalizeNodeURL,
+} from "./node-client.js";
 import { optionalString, record, stringArray } from "./wire.js";
 
 /**
@@ -65,11 +70,7 @@ export interface EndpointResolverOptions {
   readonly maximumCandidates?: number;
   /** Verified hosts of one level asked about the next level. */
   readonly maximumSources?: number;
-  /** Child directories followed per chain by {@link EndpointResolver.tree}. */
-  readonly maximumChildren?: number;
-  /** Levels below the root walked by {@link EndpointResolver.tree}. */
-  readonly maximumDepth?: number;
-  /** Requests one `resolve` or `tree` walk may make in total. */
+  /** Requests one `resolve` may make in total. */
   readonly maximumRequests?: number;
   /**
    * Resolves a declared host name to its addresses (e.g. Node's
@@ -197,7 +198,7 @@ function samePath(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((part, index) => part === right[index]);
 }
 
-/** Requests one {@link EndpointResolver.resolve} or `tree` walk may still make. */
+/** Requests one {@link EndpointResolver.resolve} may still make. */
 class Budget {
   remaining: number;
   constructor(requests: number) {
@@ -223,9 +224,9 @@ class Budget {
  * order, then each answer's order), so no host comes first by claiming a
  * greater height.
  *
- * Every request is individually timed and every walk has a request budget,
- * so a walk ends within `maximumRequests` × `timeoutMilliseconds`; pass a
- * signal for a tighter overall deadline.
+ * Every request is individually timed. `resolve` has a request budget, so it
+ * ends within `maximumRequests` × `timeoutMilliseconds`; `walk` runs until
+ * the caller stops it. Pass a signal for an overall deadline.
  */
 export class EndpointResolver {
   readonly root: NodeClient;
@@ -235,8 +236,6 @@ export class EndpointResolver {
   readonly #maximumResponseBytes: number;
   readonly #maximumCandidates: number;
   readonly #maximumSources: number;
-  readonly #maximumChildren: number;
-  readonly #maximumDepth: number;
   readonly #maximumRequests: number;
 
   constructor(root: NodeClient, options: EndpointResolverOptions = {}) {
@@ -247,8 +246,6 @@ export class EndpointResolver {
     this.#maximumResponseBytes = options.maximumResponseBytes ?? 64 * 1024;
     this.#maximumCandidates = options.maximumCandidates ?? 8;
     this.#maximumSources = options.maximumSources ?? 4;
-    this.#maximumChildren = options.maximumChildren ?? 16;
-    this.#maximumDepth = options.maximumDepth ?? 4;
     this.#maximumRequests = options.maximumRequests ?? 64;
   }
 
@@ -422,59 +419,64 @@ export class EndpointResolver {
   }
 
   /**
-   * Breadth-first walk of the hosted tree below the root: children are the
-   * directory names a source lists (`/api/chain/children`), bounded by depth,
-   * per-chain child count, and the walk's request budget. Chains the budget
-   * does not reach are left out. The node's list only grows and is not paged,
-   * so past `maximumChildren` names, or a listing over `maximumResponseBytes`,
-   * some children are not reached; `resolve` a known path instead.
+   * Every chain below the root whose hosts answer, breadth first: a chain's
+   * children are the directory names its accepted hosts list
+   * (`/api/chain/children`, every page), and each is resolved like
+   * {@link resolve}. Yields each accepted endpoint as it is found and runs
+   * until the tree ends or the caller stops (break, or abort `signal`).
+   * Every request is timed; the walk itself has no budget.
    */
-  async tree(signal?: AbortSignal): Promise<ResolvedEndpoint[]> {
-    const budget = new Budget(this.#maximumRequests);
+  async *walk(signal?: AbortSignal): AsyncGenerator<ResolvedEndpoint, void, undefined> {
+    signal?.throwIfAborted();
+    const budget = new Budget(Infinity);
     const network = await this.#network(budget, signal);
-    if (network === undefined) return [];
-    const found: ResolvedEndpoint[] = [];
+    signal?.throwIfAborted();
+    if (network === undefined) return;
     let frontier: { path: readonly string[]; sources: readonly string[] }[] = [
       { path: this.root.chainPath, sources: [this.root.baseURL] },
     ];
-    for (let depth = 0; depth < this.#maximumDepth && frontier.length > 0; depth += 1) {
+    while (frontier.length > 0) {
       const next: typeof frontier = [];
       for (const { path, sources } of frontier) {
-        const directories = await this.#childDirectories(sources, path, budget, signal);
-        for (const directory of directories) {
-          if (budget.remaining <= 0) return found;
+        for await (const directory of this.#childDirectories(sources, path, budget, signal)) {
           const level = childPath(path, directory);
           const resolved = await this.#level(sources, level, network, budget, signal);
-          found.push(...resolved);
+          signal?.throwIfAborted();
+          yield* resolved;
           if (resolved.length > 0) next.push({ path: level, sources: resolved.map((e) => e.url) });
         }
       }
       frontier = next;
     }
-    return found;
   }
 
-  async #childDirectories(
+  /**
+   * Every child directory the first answering source lists, page by page. A
+   * source that fails mid-list hands over to the next, from the last name read.
+   */
+  async *#childDirectories(
     sources: readonly string[],
     chainPath: readonly string[],
     budget: Budget,
     signal?: AbortSignal,
-  ): Promise<string[]> {
+  ): AsyncGenerator<string, void, undefined> {
+    let after: string | undefined;
     for (const source of sources.slice(0, this.#maximumSources)) {
-      if (budget.remaining <= 0) return [];
-      try {
-        const client = this.#client(source, chainPath, budget);
-        const directories = new Set<string>();
-        for (const directory of await client.childDirectories(signal)) {
-          if (directory.length === 0 || directory.includes("/")) continue;
-          directories.add(directory);
-          if (directories.size >= this.#maximumChildren) break;
+      const client = this.#client(source, chainPath, budget);
+      let page: ChildDirectoriesPage;
+      for (;;) {
+        try {
+          page = await client.childDirectories(after === undefined ? {} : { after }, signal);
+        } catch {
+          signal?.throwIfAborted();
+          break;
         }
-        return [...directories];
-      } catch {
-        continue;
+        for (const directory of page.directories) {
+          after = directory;
+          if (directory.length > 0 && !directory.includes("/")) yield directory;
+        }
+        if (page.next === undefined) return;
       }
     }
-    return [];
   }
 }
