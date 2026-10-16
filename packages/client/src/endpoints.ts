@@ -233,6 +233,10 @@ class Budget {
  * order, then each answer's order), so no host comes first by claiming a
  * greater height.
  *
+ * The root is the caller's own node: its failures (other than a 404) are
+ * thrown, so a caller can tell "busy" or "down" from "no host declared".
+ * Declared hosts that fail are passed over.
+ *
  * Every request is individually timed. `resolve` has a request budget, so it
  * ends within `maximumRequests` × `timeoutMilliseconds`; `walk` runs until
  * the caller stops it. Pass a signal for an overall deadline.
@@ -362,7 +366,8 @@ export class EndpointResolver {
       parentSources.slice(0, this.#maximumSources).map(async (source) => {
         try {
           return await this.#declared(source, chainPath, budget, signal);
-        } catch {
+        } catch (error) {
+          this.#rootFailure(source, error);
           return undefined;
         }
       }),
@@ -394,14 +399,20 @@ export class EndpointResolver {
   }
 
   /** The root's Nexus genesis, which names the network every accepted host must be on. */
-  async #network(budget: Budget, signal?: AbortSignal): Promise<string | undefined> {
-    try {
-      return await this.#client(this.root.baseURL, this.root.chainPath, budget).nexusGenesis(
-        signal,
-      );
-    } catch {
-      return undefined;
-    }
+  #network(budget: Budget, signal?: AbortSignal): Promise<string> {
+    return this.#client(this.root.baseURL, this.root.chainPath, budget).nexusGenesis(signal);
+  }
+
+  /**
+   * A declared host failing is that host's affair, and is passed over. The
+   * root failing (unreachable, an error status other than 404, or a garbled
+   * answer) is the caller's, and is thrown. An answer too large or not JSON is
+   * passed over like a 404: it is this chain's answer, not the node, at fault.
+   */
+  #rootFailure(source: string, error: unknown): void {
+    if (source !== this.root.baseURL) return;
+    if (error instanceof NodeError && (error.status === 404 || error.status < 400)) return;
+    throw error;
   }
 
   /**
@@ -421,7 +432,6 @@ export class EndpointResolver {
     }
     const budget = new Budget(this.#maximumRequests);
     const network = await this.#network(budget, signal);
-    if (network === undefined) return [];
     let sources = [this.root.baseURL];
     let resolved: ResolvedEndpoint[] = [];
     for (let depth = rootPath.length + 1; depth <= chainPath.length; depth += 1) {
@@ -445,7 +455,6 @@ export class EndpointResolver {
     const budget = new Budget(Infinity);
     const network = await this.#network(budget, signal);
     signal?.throwIfAborted();
-    if (network === undefined) return;
     let frontier: { path: readonly string[]; sources: readonly string[] }[] = [
       { path: this.root.chainPath, sources: [this.root.baseURL] },
     ];
@@ -498,6 +507,7 @@ export class EndpointResolver {
             limit = Math.max(1, Math.floor(limit / 2));
             continue;
           }
+          this.#rootFailure(source, error);
           break;
         }
         for (const directory of page.directories) {

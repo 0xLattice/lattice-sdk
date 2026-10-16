@@ -240,8 +240,32 @@ test("a root whose network cannot be read accepts nothing", async () => {
     [`${READ}/api/chain/genesis?chainPath=Nexus`]: () => new Response("{}", { status: 503 }),
   });
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
-  assert.deepEqual(await resolver.resolve(["Nexus", "testnet"]), []);
-  assert.deepEqual(await all(resolver.walk()), []);
+  // The caller's own node failing is the caller's to see, not "no hosts".
+  await assert.rejects(resolver.resolve(["Nexus", "testnet"]), { status: 503 });
+  await assert.rejects(all(resolver.walk()), { status: 503 });
+  // Its directory failing too; a 404 there just names no host.
+  const busy = network({
+    ...liveRoutes,
+    [`${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`]: () =>
+      new Response("{}", { status: 429 }),
+  });
+  await assert.rejects(
+    new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch: busy }), { fetch: busy }).resolve(
+      ["Nexus", "testnet"],
+    ),
+    { status: 429 },
+  );
+  const none = network({
+    ...liveRoutes,
+    [`${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`]: () =>
+      new Response("{}", { status: 404 }),
+  });
+  assert.deepEqual(
+    await new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch: none }), {
+      fetch: none,
+    }).resolve(["Nexus", "testnet"]),
+    [],
+  );
 });
 
 test("declared hosts that are not public HTTPS are never dialed", async () => {
@@ -615,7 +639,7 @@ test("a directory page must be in order and continue from its last name", async 
   });
 });
 
-test("a source whose next never advances is left for the next source", async () => {
+test("a root whose next never advances fails the walk instead of looping", async () => {
   const fetch = network({
     [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
     [`${READ}/api/chain/children?chainPath=Nexus&limit=200`]: JSON.stringify({
@@ -631,7 +655,7 @@ test("a source whose next never advances is left for the next source", async () 
     }),
   });
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
-  assert.deepEqual(await all(resolver.walk()), []);
+  await assert.rejects(all(resolver.walk()), /does not advance/);
   await assert.rejects(
     new NodeClient(READ, ["Nexus"], { fetch }).childDirectories({ after: "a", limit: 200 }),
     /does not advance/,
