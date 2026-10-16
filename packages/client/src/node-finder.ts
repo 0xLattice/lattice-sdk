@@ -119,7 +119,21 @@ export class ChainNodeFinder {
       .filter((url) => url !== start);
     const fresh = (url: string) => !(this.#now() < (this.#failed.get(`${key} ${url}`) ?? 0));
     const url = hosts.find(fresh) ?? hosts[0];
-    if (url === undefined) throw new ChainOfflineError(chainPath);
+    if (url === undefined) {
+      // Nothing found. If the start node's own part of the walk failed (its
+      // network, or its directory for the first level), that is its failure,
+      // thrown as is; a directory that names no host (404) is the chain's.
+      await Promise.all([
+        new NodeClient(start, at, {
+          fetch: this.#fetch,
+          timeoutMilliseconds: this.#timeout,
+        }).nexusGenesis(),
+        resolver.declared(start, chainPath.slice(0, at.length + 1)).catch((error: unknown) => {
+          if (!(error instanceof NodeError && error.status === 404)) throw error;
+        }),
+      ]);
+      throw new ChainOfflineError(chainPath);
+    }
     entry.until = this.#now() + this.#ttl;
     return { url, found: true };
   }

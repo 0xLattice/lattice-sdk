@@ -137,3 +137,30 @@ test("the start node is never a found node, and is never marked failed", async (
   });
   await assert.rejects(finder.nodeFor(["N", "x"]), ChainOfflineError);
 });
+
+test("a start node failing during the search is its own failure, not offline", async () => {
+  const busy = async (input: string | URL): Promise<Response> => {
+    const url = new URL(input);
+    const chain = url.searchParams.get("chainPath") ?? "";
+    if (url.pathname === "/api/chain/info" && chain === "N") {
+      return new Response(JSON.stringify({ chain: ["N"], height: "3" }));
+    }
+    if (url.pathname === "/api/chain/endpoints") return new Response("{}", { status: 429 });
+    if (url.pathname === "/api/chain/genesis") {
+      return new Response(JSON.stringify({ genesisHash: NEXUS }));
+    }
+    return new Response("{}", { status: 404 });
+  };
+  await assert.rejects(new ChainNodeFinder(START, { fetch: busy }).nodeFor(["N", "x"]), {
+    status: 429,
+  });
+  // The directory answering that no host is known: offline.
+  const none = async (input: string | URL): Promise<Response> =>
+    new URL(input).pathname === "/api/chain/endpoints"
+      ? new Response("{}", { status: 404 })
+      : busy(input);
+  await assert.rejects(
+    new ChainNodeFinder(START, { fetch: none }).nodeFor(["N", "x"]),
+    ChainOfflineError,
+  );
+});
