@@ -7,9 +7,10 @@ import { optionalString, record, stringArray } from "./wire.js";
  *
  * This module is deliberately separate from `NodeClient`: a declared URL is a
  * third party's claim relayed by the node, not something the node vouches
- * for. The resolver accepts a declared host only after it serves the block the
- * parent chain commits for that child, and even then the result is labeled
- * {@link OPERATOR_DECLARED}. Submit capability is reported as data only; a
+ * for. A child is found through the hosts that announce it, never through
+ * what its parent commits: the resolver accepts a declared host when it
+ * serves the chain at that path on the root's network, and even then the
+ * result is labeled {@link OPERATOR_DECLARED}. Submit capability is reported as data only; a
  * caller that wants to send a transaction must construct a
  * `TransactionSubmitter` itself.
  */
@@ -18,7 +19,11 @@ export const OPERATOR_DECLARED = "operator-declared, not independently verified"
 /** The raw `GET /api/chain/endpoints?chainPath=P/D` answer. */
 export interface DeclaredEndpoints {
   readonly chainPath: readonly string[];
-  /** Absent when the answering node hosts the child but its parent commits none recently. */
+  /**
+   * The newest child block the parent's recent blocks commit, or absent.
+   * Information only: it can be a block the child chain did not keep, or one
+   * nobody serves, so no host is required to serve it.
+   */
   readonly committedBlock?: string;
   readonly endpoints: readonly string[];
   readonly submitEndpoints: readonly string[];
@@ -42,12 +47,10 @@ export function parseDeclaredEndpoints(value: unknown): DeclaredEndpoints {
   };
 }
 
-/** A declared host that served the committed child block. */
+/** A declared host that serves the chain at its path, on the root's network. */
 export interface ResolvedEndpoint {
   readonly url: string;
   readonly chainPath: readonly string[];
-  /** The parent-committed child block this host served. */
-  readonly committedBlock: string;
   /** The host's declared `POST /transactions` support; unverified data only. */
   readonly declaresSubmit: boolean;
   readonly trust: typeof OPERATOR_DECLARED;
@@ -207,15 +210,18 @@ class Budget {
 }
 
 /**
- * Walks operator-declared endpoints down from a caller-chosen root node. The
- * root is the only host dialed as given; every other host is a declared URL
- * that passed {@link declaredEndpointURL} (and `lookup`, when given) and
- * served the committed child block.
+ * Walks operator-declared endpoints down from a caller-chosen root node, the
+ * same rule at every level: a level's accepted hosts are asked for the next
+ * level's declared URLs. The root is the only host dialed as given; every
+ * other host is a declared URL that passed {@link declaredEndpointURL} (and
+ * `lookup`, when given) and answered positively that it serves the chain at
+ * that path (`/api/chain/info` names it and has a tip), with the root's Nexus
+ * genesis (every network names its chains `Nexus/...`). What a parent commits
+ * never decides acceptance. This is a consistency check, not proof.
  *
- * Trust is chained: the first level's `committedBlock` comes from the root;
- * a deeper level's comes from a host that was itself only declared. Each
- * candidate is checked against the block named by the answer that declared
- * it, so one source cannot spoil another source's candidates.
+ * Accepted hosts keep the order they were declared in (by the sources in
+ * order, then each answer's order), so no host comes first by claiming a
+ * greater height.
  *
  * Every request is individually timed and every walk has a request budget,
  * so a walk ends within `maximumRequests` × `timeoutMilliseconds`; pass a
@@ -310,28 +316,30 @@ export class EndpointResolver {
     }
   }
 
-  /** Whether `baseURL` serves `committedBlock` on `chainPath`. */
+  /** Whether `baseURL` serves `chainPath`, with a tip, on the network `nexusGenesis` names. */
   async #serves(
     baseURL: string,
     chainPath: readonly string[],
-    committedBlock: string,
+    nexusGenesis: string,
     budget: Budget,
     signal?: AbortSignal,
   ): Promise<boolean> {
     try {
       if (!(await this.#resolvesPublic(baseURL, signal))) return false;
       const client = this.#client(baseURL, chainPath, budget);
-      const block = await client.block(committedBlock, signal);
-      return block.hash === committedBlock && samePath(block.chain, chainPath);
+      const info = await client.chainInfo(signal);
+      if (!samePath(info.chain, chainPath) || info.height === undefined) return false;
+      return (await client.nexusGenesis(signal)) === nexusGenesis;
     } catch {
       return false;
     }
   }
 
-  /** Verified endpoints of `parentSources`' child `chainPath`. */
+  /** Accepted endpoints of `parentSources`' child `chainPath`, in declared order. */
   async #level(
     parentSources: readonly string[],
     chainPath: readonly string[],
+    nexusGenesis: string,
     budget: Budget,
     signal?: AbortSignal,
   ): Promise<ResolvedEndpoint[]> {
@@ -344,57 +352,46 @@ export class EndpointResolver {
         }
       }),
     );
-    // Keyed by URL and committed block: a source naming a wrong block for a
-    // URL cannot keep that URL from being checked against another source's.
-    const candidates = new Map<
-      string,
-      { url: string; committedBlock: string; declaresSubmit: boolean }
-    >();
+    const candidates = new Map<string, { url: string; declaresSubmit: boolean }>();
     for (const answer of answers) {
-      if (answer?.committedBlock === undefined) continue;
+      if (answer === undefined) continue;
       const submit = new Set(answer.submitEndpoints.map(declaredEndpointURL));
       for (const declared of answer.endpoints) {
-        if (candidates.size >= this.#maximumCandidates) break;
         const url = declaredEndpointURL(declared);
-        const key = `${url} ${answer.committedBlock}`;
-        if (url === undefined || candidates.has(key)) continue;
-        candidates.set(key, {
-          url,
-          committedBlock: answer.committedBlock,
-          declaresSubmit: submit.has(url),
-        });
+        if (url === undefined) continue;
+        const seen = candidates.get(url);
+        if (seen !== undefined) {
+          seen.declaresSubmit ||= submit.has(url);
+          continue;
+        }
+        if (candidates.size >= this.#maximumCandidates) continue;
+        candidates.set(url, { url, declaresSubmit: submit.has(url) });
       }
     }
-    const verified = await Promise.all(
-      [...candidates.values()].map(async ({ url, committedBlock, declaresSubmit }) =>
-        (await this.#serves(url, chainPath, committedBlock, budget, signal))
-          ? {
-              url,
-              chainPath: [...chainPath],
-              committedBlock,
-              declaresSubmit,
-              trust: OPERATOR_DECLARED,
-            }
+    const accepted = await Promise.all(
+      [...candidates.values()].map(async ({ url, declaresSubmit }) =>
+        (await this.#serves(url, chainPath, nexusGenesis, budget, signal))
+          ? { url, chainPath: [...chainPath], declaresSubmit, trust: OPERATOR_DECLARED }
           : undefined,
       ),
     );
-    const byURL = new Map<string, ResolvedEndpoint>();
-    for (const entry of verified) {
-      if (entry === undefined) continue;
-      const seen = byURL.get(entry.url);
-      byURL.set(
-        entry.url,
-        seen === undefined
-          ? entry
-          : { ...seen, declaresSubmit: seen.declaresSubmit || entry.declaresSubmit },
+    return accepted.filter((entry) => entry !== undefined);
+  }
+
+  /** The root's Nexus genesis, which names the network every accepted host must be on. */
+  async #network(budget: Budget, signal?: AbortSignal): Promise<string | undefined> {
+    try {
+      return await this.#client(this.root.baseURL, this.root.chainPath, budget).nexusGenesis(
+        signal,
       );
+    } catch {
+      return undefined;
     }
-    return [...byURL.values()];
   }
 
   /**
-   * Verified declared endpoints for `chainPath`, which must extend the root's
-   * chain path. Each level's verified hosts are asked about the next level.
+   * Accepted declared endpoints for `chainPath`, which must extend the root's
+   * chain path. Each level's accepted hosts are asked about the next level.
    */
   async resolve(chainPath: readonly string[], signal?: AbortSignal): Promise<ResolvedEndpoint[]> {
     const rootPath = this.root.chainPath;
@@ -408,10 +405,12 @@ export class EndpointResolver {
       throw new RangeError("chainPath components must be non-empty and contain no '/'");
     }
     const budget = new Budget(this.#maximumRequests);
+    const network = await this.#network(budget, signal);
+    if (network === undefined) return [];
     let sources = [this.root.baseURL];
     let resolved: ResolvedEndpoint[] = [];
     for (let depth = rootPath.length + 1; depth <= chainPath.length; depth += 1) {
-      resolved = await this.#level(sources, chainPath.slice(0, depth), budget, signal);
+      resolved = await this.#level(sources, chainPath.slice(0, depth), network, budget, signal);
       if (resolved.length === 0) return [];
       sources = resolved.map((entry) => entry.url);
     }
@@ -419,13 +418,15 @@ export class EndpointResolver {
   }
 
   /**
-   * Breadth-first walk of the hosted tree below the root: children come from
-   * a source's latest block commitments (`/api/block/:cid/children`), bounded
-   * by depth, per-chain child count, and the walk's request budget. Chains
-   * the budget does not reach are left out.
+   * Breadth-first walk of the hosted tree below the root: children are the
+   * directory names a source lists (`/api/chain/children`), bounded by depth,
+   * per-chain child count, and the walk's request budget. Chains the budget
+   * does not reach are left out.
    */
   async tree(signal?: AbortSignal): Promise<ResolvedEndpoint[]> {
     const budget = new Budget(this.#maximumRequests);
+    const network = await this.#network(budget, signal);
+    if (network === undefined) return [];
     const found: ResolvedEndpoint[] = [];
     let frontier: { path: readonly string[]; sources: readonly string[] }[] = [
       { path: this.root.chainPath, sources: [this.root.baseURL] },
@@ -437,7 +438,7 @@ export class EndpointResolver {
         for (const directory of directories) {
           if (budget.remaining <= 0) return found;
           const level = childPath(path, directory);
-          const resolved = await this.#level(sources, level, budget, signal);
+          const resolved = await this.#level(sources, level, network, budget, signal);
           found.push(...resolved);
           if (resolved.length > 0) next.push({ path: level, sources: resolved.map((e) => e.url) });
         }
@@ -457,11 +458,10 @@ export class EndpointResolver {
       if (budget.remaining <= 0) return [];
       try {
         const client = this.#client(source, chainPath, budget);
-        const latest = await client.latestBlock(signal);
         const directories = new Set<string>();
-        for (const child of await client.children(latest.hash, signal)) {
-          if (child.directory.length === 0 || child.directory.includes("/")) continue;
-          directories.add(child.directory);
+        for (const directory of await client.childDirectories(signal)) {
+          if (directory.length === 0 || directory.includes("/")) continue;
+          directories.add(directory);
           if (directories.size >= this.#maximumChildren) break;
         }
         return [...directories];
