@@ -64,14 +64,18 @@ export class ChainNodes {
 
   /** The nodes serving `chainPath`, in the order {@link read} tries them. */
   list(chainPath: readonly string[]): Promise<ChainNode[]> {
-    const key = chainPath.join("/");
+    const key = JSON.stringify(chainPath);
     const kept = this.#lists.get(key);
     if (kept !== undefined && this.#now() < kept.until) return kept.list;
-    const entry = { list: this.#list([...chainPath]), until: this.#now() + this.#ttl };
+    // Kept from when the list is made, not asked for.
+    const entry = { list: this.#list([...chainPath]), until: Infinity };
     this.#lists.set(key, entry);
-    entry.list.catch(() => {
-      if (this.#lists.get(key) === entry) this.#lists.delete(key);
-    });
+    entry.list.then(
+      () => (entry.until = this.#now() + this.#ttl),
+      () => {
+        if (this.#lists.get(key) === entry) this.#lists.delete(key);
+      },
+    );
     return entry.list;
   }
 
@@ -106,24 +110,29 @@ export class ChainNodes {
   }
 
   async #list(chainPath: string[]): Promise<ChainNode[]> {
+    const own = (await this.#serves(chainPath)) ? [{ url: this.startURL, found: false }] : [];
+    // When the start node serves the chain itself, failing to find others
+    // costs only the fallbacks.
+    return this.#declared(chainPath).then(
+      (found) => [...own, ...found],
+      (error: unknown) => {
+        if (own.length > 0) return own;
+        throw error;
+      },
+    );
+  }
+
+  /** The declared hosts of `chainPath` other than the start node, from its nearest served ancestor. */
+  async #declared(chainPath: string[]): Promise<ChainNode[]> {
     const start = this.startURL;
-    const own = (await this.#serves(chainPath)) ? [{ url: start, found: false }] : [];
     let at = chainPath.slice(0, -1);
     while (at.length > 0 && !(await this.#serves(at))) at = at.slice(0, -1);
-    if (at.length === 0) return own;
+    if (at.length === 0) return [];
     const resolver = new EndpointResolver(new NodeClient(start, at, { fetch: this.#fetch }), {
       ...this.#resolver,
       fetch: this.#fetch,
     });
-    // When the start node serves the chain itself, its directory failing
-    // costs only the fallbacks.
-    const hosts = await resolver.resolve(chainPath).catch((error: unknown) => {
-      if (own.length > 0) return [];
-      throw error;
-    });
-    return [
-      ...own,
-      ...hosts.filter(({ url }) => url !== start).map(({ url }) => ({ url, found: true })),
-    ];
+    const hosts = await resolver.resolve(chainPath);
+    return hosts.filter(({ url }) => url !== start).map(({ url }) => ({ url, found: true }));
   }
 }

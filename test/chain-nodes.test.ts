@@ -135,6 +135,16 @@ test("the start node failing is its own failure, not offline", async () => {
   assert.deepEqual(await new ChainNodes(START, { fetch: servesIt }).list(["N", "x"]), [
     { url: START, found: false },
   ]);
+  // Or its answer for the chain above.
+  const parentBusy = async (input: string | URL): Promise<Response> => {
+    const url = new URL(input);
+    return url.pathname === "/api/chain/info" && url.searchParams.get("chainPath") === "N"
+      ? new Response("{}", { status: 503 })
+      : network({ [START]: ["N", "N/x"] })(input);
+  };
+  assert.deepEqual(await new ChainNodes(START, { fetch: parentBusy }).list(["N", "x"]), [
+    { url: START, found: false },
+  ]);
 });
 
 test("concurrent reads share one lookup", async () => {

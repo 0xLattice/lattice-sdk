@@ -639,7 +639,7 @@ test("a directory page must be in order and continue from its last name", async 
   });
 });
 
-test("a root whose next never advances fails the walk instead of looping", async () => {
+test("a listing whose next never advances is passed over instead of looping", async () => {
   const fetch = network({
     [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
     [`${READ}/api/chain/children?chainPath=Nexus&limit=200`]: JSON.stringify({
@@ -655,7 +655,7 @@ test("a root whose next never advances fails the walk instead of looping", async
     }),
   });
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
-  await assert.rejects(all(resolver.walk()), /does not advance/);
+  assert.deepEqual(await all(resolver.walk()), []);
   await assert.rejects(
     new NodeClient(READ, ["Nexus"], { fetch }).childDirectories({ after: "a", limit: 200 }),
     /does not advance/,
@@ -740,4 +740,17 @@ test("a page over the response cap is asked again smaller, and one long name sti
     "1:b",
     "200:x",
   ]);
+});
+
+test("the root declared again at a deeper level fails there as any declared host does", async () => {
+  const fetch = network({
+    [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
+    // The root hosts A and declares itself for it, so it is a source for A's children.
+    ...declaring(READ, ["Nexus", "A"], [READ]),
+    ...serving(READ, ["Nexus", "A"]),
+    [`${READ}/api/chain/endpoints?chainPath=Nexus%2FA%2FB`]: () =>
+      new Response("{}", { status: 503 }),
+  });
+  const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
+  assert.deepEqual(await resolver.resolve(["Nexus", "A", "B"]), []);
 });

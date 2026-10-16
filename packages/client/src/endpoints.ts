@@ -362,12 +362,13 @@ export class EndpointResolver {
     budget: Budget,
     signal?: AbortSignal,
   ): Promise<ResolvedEndpoint[]> {
+    const fromRoot = samePath(chainPath.slice(0, -1), this.root.chainPath);
     const answers = await Promise.all(
       parentSources.slice(0, this.#maximumSources).map(async (source) => {
         try {
           return await this.#declared(source, chainPath, budget, signal);
         } catch (error) {
-          this.#rootFailure(source, error);
+          if (fromRoot) this.#rootFailure(source, error);
           return undefined;
         }
       }),
@@ -405,14 +406,17 @@ export class EndpointResolver {
 
   /**
    * A declared host failing is that host's affair, and is passed over. The
-   * root failing (unreachable, an error status other than 404, or a garbled
-   * answer) is the caller's, and is thrown. An answer too large or not JSON is
-   * passed over like a 404: it is this chain's answer, not the node, at fault.
+   * root failing on its own level (an error status other than 404, or no
+   * answer in time) is the caller's, and is thrown. Anything else from it (a
+   * 404, an answer too large or malformed) is passed over: that is this
+   * chain's answer, not the node, at fault. The root unreachable shows in
+   * reading its genesis, which every walk does first.
    */
   #rootFailure(source: string, error: unknown): void {
     if (source !== this.root.baseURL) return;
-    if (error instanceof NodeError && (error.status === 404 || error.status < 400)) return;
-    throw error;
+    const status = error instanceof NodeError && error.status >= 400 && error.status !== 404;
+    const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+    if (status || timedOut) throw error;
   }
 
   /**
@@ -507,7 +511,7 @@ export class EndpointResolver {
             limit = Math.max(1, Math.floor(limit / 2));
             continue;
           }
-          this.#rootFailure(source, error);
+          if (samePath(chainPath, this.root.chainPath)) this.#rootFailure(source, error);
           break;
         }
         for (const directory of page.directories) {
