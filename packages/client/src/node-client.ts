@@ -151,6 +151,36 @@ export class NodeClient {
     ) as Promise<BlockChild[]>;
   }
 
+  /**
+   * The child directories this chain's executed blocks have committed
+   * (`GET /api/chain/children`). The node's list only grows: a directory
+   * committed on a branch that lost stays listed. A child is reached through
+   * its hosts, not through what the parent commits.
+   */
+  childDirectories(signal?: AbortSignal): Promise<string[]> {
+    return this.#request(
+      "/api/chain/children",
+      (value) => {
+        const body = record(value, "chain children");
+        const chainPath = stringArray(body.chainPath, "chainChildren.chainPath");
+        if (chainPath.join("/") !== this.chainPath.join("/")) {
+          throw new TypeError("chain children answer names a different chainPath");
+        }
+        return stringArray(body.directories, "chainChildren.directories");
+      },
+      signal,
+    ) as Promise<string[]>;
+  }
+
+  /** The node's Nexus genesis (`GET /api/chain/genesis`): which network it is on. */
+  nexusGenesis(signal?: AbortSignal): Promise<string> {
+    return this.#request(
+      "/api/chain/genesis",
+      (value) => string(record(value, "chain genesis").genesisHash, "chainGenesis.genesisHash"),
+      signal,
+    ) as Promise<string>;
+  }
+
   account(owner: string, signal?: AbortSignal): Promise<AccountState> {
     return this.#request(
       `/api/state/account/${encodeURIComponent(owner)}`,

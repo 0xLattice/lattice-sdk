@@ -14,8 +14,8 @@ const fixture = (name: string): string =>
 
 const READ = "https://lattice-mainnet-read.fly.dev";
 const FOLLOWER = "https://lattice-mainnet-testnet.fly.dev";
-const TIP = "bafyreicmsum2butkopy4xxyzxmirzkcagzjxi2cuubzzuyowk7uzq2sh7i";
 const CHILD = "bafyreiaomyjl7iryqain2l4jkz4knp5cvukkhgrbngjfl53llkeql7dnb4";
+const NEXUS = "bafynexusgenesis";
 
 type Routes = Record<string, string | (() => Response | Promise<Response>)>;
 
@@ -43,14 +43,41 @@ function network(routes: Routes, dialed: string[] = []) {
   };
 }
 
+const query = (path: string[]) => encodeURIComponent(path.join("/"));
+/** Routes for a host that serves `path` (with a tip) on the network `genesis` names. */
+const serving = (host: string, path: string[], genesis = NEXUS): Routes => ({
+  [`${host}/api/chain/info?chainPath=${query(path)}`]: JSON.stringify({
+    chain: path,
+    height: "7",
+    tipCID: "bafytip",
+  }),
+  [`${host}/api/chain/genesis?chainPath=${query(path)}`]: JSON.stringify({ genesisHash: genesis }),
+});
+const declaring = (
+  host: string,
+  path: string[],
+  endpoints: string[],
+  committedBlock?: string | null,
+) => ({
+  [`${host}/api/chain/endpoints?chainPath=${query(path)}`]: JSON.stringify({
+    chainPath: path,
+    committedBlock: committedBlock ?? null,
+    endpoints,
+    submitEndpoints: [],
+  }),
+});
+
 const liveRoutes: Routes = {
+  [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
   [`${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`]: fixture("read-endpoints-testnet.json"),
-  [`${FOLLOWER}/api/block/${CHILD}?chainPath=Nexus%2Ftestnet`]: fixture("testnet-child-block.json"),
-  [`${READ}/api/block/latest?chainPath=Nexus`]: fixture("read-latest.json"),
-  [`${READ}/api/block/${TIP}/children?chainPath=Nexus`]: fixture("read-children.json"),
+  ...serving(FOLLOWER, ["Nexus", "testnet"]),
+  [`${READ}/api/chain/children?chainPath=Nexus`]: JSON.stringify({
+    chainPath: ["Nexus"],
+    directories: ["testnet"],
+  }),
 };
 
-test("the live testnet declaration resolves once the follower serves the committed block", async () => {
+test("the live testnet declaration resolves once the follower serves the chain on this network", async () => {
   const dialed: string[] = [];
   const fetch = network(liveRoutes, dialed);
   const root = new NodeClient(READ, ["Nexus"], { fetch });
@@ -59,19 +86,25 @@ test("the live testnet declaration resolves once the follower serves the committ
     {
       url: FOLLOWER,
       chainPath: ["Nexus", "testnet"],
-      committedBlock: CHILD,
       declaresSubmit: false,
       trust: OPERATOR_DECLARED,
     },
   ]);
   assert.equal(OPERATOR_DECLARED, "operator-declared, not independently verified");
   assert.deepEqual(dialed, [
+    `${READ}/api/chain/genesis?chainPath=Nexus`,
     `${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`,
-    `${FOLLOWER}/api/block/${CHILD}?chainPath=Nexus%2Ftestnet`,
+    `${FOLLOWER}/api/chain/info?chainPath=Nexus%2Ftestnet`,
+    `${FOLLOWER}/api/chain/genesis?chainPath=Nexus%2Ftestnet`,
   ]);
+  // What the parent commits is never asked for.
+  assert.equal(
+    dialed.some((key) => key.includes(CHILD)),
+    false,
+  );
 });
 
-test("the tree walk finds children from the root's latest block commitments", async () => {
+test("the tree walk finds children from the root's directory names", async () => {
   const fetch = network(liveRoutes);
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), {
     fetch,
@@ -84,24 +117,31 @@ test("the tree walk finds children from the root's latest block commitments", as
   );
 });
 
-test("a host that does not serve the committed block is not accepted", async () => {
-  const forged = { ...JSON.parse(fixture("testnet-child-block.json")), hash: "bafyother" };
+test("a host is accepted only on a positive answer for the chain, with a tip, on this network", async () => {
+  const info = `${FOLLOWER}/api/chain/info?chainPath=Nexus%2Ftestnet`;
+  const genesis = `${FOLLOWER}/api/chain/genesis?chainPath=Nexus%2Ftestnet`;
+  const refusals: Routes[] = [
+    { [info]: JSON.stringify({ chain: ["Nexus"], height: "7" }) },
+    { [info]: JSON.stringify({ chain: ["Nexus", "testnet"] }) },
+    { [info]: () => new Response("{}", { status: 404 }) },
+    { [genesis]: JSON.stringify({ genesisHash: "bafyothernetwork" }) },
+    { [genesis]: () => new Response("{}", { status: 500 }) },
+  ];
+  for (const refusal of refusals) {
+    const fetch = network({ ...liveRoutes, ...refusal });
+    const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
+    assert.deepEqual(await resolver.resolve(["Nexus", "testnet"]), [], Object.keys(refusal)[0]);
+  }
+});
+
+test("a root whose network cannot be read accepts nothing", async () => {
   const fetch = network({
     ...liveRoutes,
-    [`${FOLLOWER}/api/block/${CHILD}?chainPath=Nexus%2Ftestnet`]: JSON.stringify(forged),
+    [`${READ}/api/chain/genesis?chainPath=Nexus`]: () => new Response("{}", { status: 503 }),
   });
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
   assert.deepEqual(await resolver.resolve(["Nexus", "testnet"]), []);
-
-  const wrongChain = { ...JSON.parse(fixture("testnet-child-block.json")), chain: ["Nexus"] };
-  const fetch2 = network({
-    ...liveRoutes,
-    [`${FOLLOWER}/api/block/${CHILD}?chainPath=Nexus%2Ftestnet`]: JSON.stringify(wrongChain),
-  });
-  const resolver2 = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch: fetch2 }), {
-    fetch: fetch2,
-  });
-  assert.deepEqual(await resolver2.resolve(["Nexus", "testnet"]), []);
+  assert.deepEqual(await resolver.tree(), []);
 });
 
 test("declared hosts that are not public HTTPS are never dialed", async () => {
@@ -149,6 +189,7 @@ test("declared hosts that are not public HTTPS are never dialed", async () => {
   const dialed: string[] = [];
   const fetch = network(
     {
+      [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
       [`${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`]: JSON.stringify({
         chainPath: ["Nexus", "testnet"],
         committedBlock: CHILD,
@@ -160,27 +201,23 @@ test("declared hosts that are not public HTTPS are never dialed", async () => {
   );
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
   assert.deepEqual(await resolver.resolve(["Nexus", "testnet"]), []);
-  assert.deepEqual(dialed, [`${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`]);
+  assert.deepEqual(dialed, [
+    `${READ}/api/chain/genesis?chainPath=Nexus`,
+    `${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`,
+  ]);
 });
 
-test("submit capability is declared data only, and a null committedBlock verifies nothing", async () => {
-  const block = (chain: string[]) =>
-    JSON.stringify({ ...JSON.parse(fixture("testnet-child-block.json")), chain });
+test("submit capability is declared data only, and the committed block never decides", async () => {
   const fetch = network({
+    [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
     [`${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`]: JSON.stringify({
       chainPath: ["Nexus", "testnet"],
       committedBlock: CHILD,
       endpoints: ["https://a.example.org", "https://b.example.org"],
       submitEndpoints: ["https://b.example.org/"],
     }),
-    [`https://a.example.org/api/block/${CHILD}?chainPath=Nexus%2Ftestnet`]: block([
-      "Nexus",
-      "testnet",
-    ]),
-    [`https://b.example.org/api/block/${CHILD}?chainPath=Nexus%2Ftestnet`]: block([
-      "Nexus",
-      "testnet",
-    ]),
+    ...serving("https://a.example.org", ["Nexus", "testnet"]),
+    ...serving("https://b.example.org", ["Nexus", "testnet"]),
   });
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
   const resolved = await resolver.resolve(["Nexus", "testnet"]);
@@ -193,18 +230,22 @@ test("submit capability is declared data only, and a null committedBlock verifie
   );
   for (const entry of resolved) assert.equal("submit" in entry, false);
 
-  const unanchored = network({
-    [`${READ}/api/chain/endpoints?chainPath=Nexus%2Ftestnet`]: JSON.stringify({
-      chainPath: ["Nexus", "testnet"],
-      committedBlock: null,
-      endpoints: ["https://a.example.org"],
-      submitEndpoints: [],
-    }),
-  });
-  const resolver2 = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch: unanchored }), {
-    fetch: unanchored,
-  });
-  assert.deepEqual(await resolver2.resolve(["Nexus", "testnet"]), []);
+  // Committed nothing, or a block no host serves (one the child chain did not keep): still found.
+  for (const committedBlock of [null, "bafylostblock"]) {
+    const routed = network({
+      [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
+      ...declaring(READ, ["Nexus", "testnet"], ["https://a.example.org"], committedBlock),
+      ...serving("https://a.example.org", ["Nexus", "testnet"]),
+    });
+    const resolver2 = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch: routed }), {
+      fetch: routed,
+    });
+    assert.deepEqual(
+      (await resolver2.resolve(["Nexus", "testnet"])).map((entry) => entry.url),
+      ["https://a.example.org"],
+      String(committedBlock),
+    );
+  }
 });
 
 test("an older node without submitEndpoints reads as none", async () => {
@@ -235,35 +276,26 @@ test("an answer naming a different chain is refused", async () => {
   await assert.rejects(resolver.declared(READ, ["Nexus", "testnet"]), /different chainPath/);
 });
 
-test("the walk recurses through verified hosts only, bounded and timed per request", async () => {
-  const childBlock = (hash: string, chain: string[]) =>
-    JSON.stringify({ ...JSON.parse(fixture("testnet-child-block.json")), hash, chain });
+test("the walk recurses through accepted hosts only, bounded and timed per request", async () => {
   const many = Array.from({ length: 20 }, (_, index) => `https://h${index}.example.org`);
   const dialed: string[] = [];
   const fetch = network(
     {
-      [`${READ}/api/chain/endpoints?chainPath=Nexus%2FA`]: JSON.stringify({
-        chainPath: ["Nexus", "A"],
-        committedBlock: "bafyA",
-        endpoints: ["https://a.example.org", "https://slow.example.org", ...many],
-        submitEndpoints: [],
-      }),
-      [`https://a.example.org/api/block/bafyA?chainPath=Nexus%2FA`]: childBlock("bafyA", [
-        "Nexus",
-        "A",
-      ]),
-      [`https://slow.example.org/api/block/bafyA?chainPath=Nexus%2FA`]: () => new Promise(() => {}),
+      [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
+      ...declaring(
+        READ,
+        ["Nexus", "A"],
+        ["https://a.example.org", "https://slow.example.org", ...many],
+      ),
+      ...serving("https://a.example.org", ["Nexus", "A"]),
+      [`https://slow.example.org/api/chain/info?chainPath=Nexus%2FA`]: () => new Promise(() => {}),
       [`https://a.example.org/api/chain/endpoints?chainPath=Nexus%2FA%2FB`]: JSON.stringify({
         chainPath: ["Nexus", "A", "B"],
-        committedBlock: "bafyB",
+        committedBlock: null,
         endpoints: ["https://b.example.org"],
         submitEndpoints: ["https://b.example.org"],
       }),
-      [`https://b.example.org/api/block/bafyB?chainPath=Nexus%2FA%2FB`]: childBlock("bafyB", [
-        "Nexus",
-        "A",
-        "B",
-      ]),
+      ...serving("https://b.example.org", ["Nexus", "A", "B"]),
     },
     dialed,
   );
@@ -277,10 +309,13 @@ test("the walk recurses through verified hosts only, bounded and timed per reque
     resolved.map((entry) => [entry.url, entry.chainPath.join("/"), entry.declaresSubmit]),
     [["https://b.example.org", "Nexus/A/B", true]],
   );
-  const probes = dialed.filter((key) => key.includes("/api/block/bafyA"));
+  const probes = dialed.filter((key) => key.endsWith("/api/chain/info?chainPath=Nexus%2FA"));
   assert.equal(probes.length, 4);
-  // The slow host was never a source for the next level.
-  assert.equal(dialed.filter((key) => key.startsWith("https://slow.")).length, 1);
+  // The slow host was probed (chain info and genesis) but never a source for the next level.
+  assert.deepEqual(
+    dialed.filter((key) => key.startsWith("https://slow.")).map((key) => new URL(key).pathname),
+    ["/api/chain/info", "/api/chain/genesis"],
+  );
 
   await assert.rejects(resolver.resolve(["Nexus"]), /descendant/);
   await assert.rejects(resolver.resolve(["Other", "A"]), /descendant/);
@@ -295,7 +330,7 @@ test("requests refuse redirects so a declared host cannot steer them elsewhere",
   };
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
   assert.equal((await resolver.resolve(["Nexus", "testnet"])).length, 1);
-  assert.deepEqual(modes, ["error", "error"]);
+  assert.deepEqual(modes, ["error", "error", "error", "error"]);
 });
 
 test("with a lookup, a declared name resolving to a private address is never dialed", async () => {
@@ -320,46 +355,24 @@ test("with a lookup, a declared name resolving to a private address is never dia
   assert.equal((await publicOnly.resolve(["Nexus", "testnet"])).length, 1);
 });
 
-test("a source naming a wrong committed block cannot spoil another source's candidate", async () => {
-  const fetch = network({
-    [`${READ}/api/chain/endpoints?chainPath=Nexus%2FA`]: JSON.stringify({
-      chainPath: ["Nexus", "A"],
-      committedBlock: "bafyA",
-      endpoints: ["https://a.example.org", "https://b.example.org"],
-      submitEndpoints: [],
-    }),
-    [`https://a.example.org/api/block/bafyA?chainPath=Nexus%2FA`]: JSON.stringify({
-      ...JSON.parse(fixture("testnet-child-block.json")),
-      hash: "bafyA",
+test("accepted hosts keep their declared order, whatever height they claim", async () => {
+  const hosts = ["https://a.example.org", "https://b.example.org", "https://c.example.org"];
+  const routes: Routes = {
+    [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
+    ...declaring(READ, ["Nexus", "A"], hosts),
+  };
+  for (const [index, host] of hosts.entries()) {
+    Object.assign(routes, serving(host, ["Nexus", "A"]));
+    routes[`${host}/api/chain/info?chainPath=Nexus%2FA`] = JSON.stringify({
       chain: ["Nexus", "A"],
-    }),
-    [`https://b.example.org/api/block/bafyA?chainPath=Nexus%2FA`]: JSON.stringify({
-      ...JSON.parse(fixture("testnet-child-block.json")),
-      hash: "bafyA",
-      chain: ["Nexus", "A"],
-    }),
-    [`https://a.example.org/api/chain/endpoints?chainPath=Nexus%2FA%2FB`]: JSON.stringify({
-      chainPath: ["Nexus", "A", "B"],
-      committedBlock: "bafyWrong",
-      endpoints: ["https://c.example.org"],
-      submitEndpoints: [],
-    }),
-    [`https://b.example.org/api/chain/endpoints?chainPath=Nexus%2FA%2FB`]: JSON.stringify({
-      chainPath: ["Nexus", "A", "B"],
-      committedBlock: "bafyB",
-      endpoints: ["https://c.example.org"],
-      submitEndpoints: [],
-    }),
-    [`https://c.example.org/api/block/bafyB?chainPath=Nexus%2FA%2FB`]: JSON.stringify({
-      ...JSON.parse(fixture("testnet-child-block.json")),
-      hash: "bafyB",
-      chain: ["Nexus", "A", "B"],
-    }),
-  });
+      height: String(10 ** (index + 1)),
+    });
+  }
+  const fetch = network(routes);
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), { fetch });
   assert.deepEqual(
-    (await resolver.resolve(["Nexus", "A", "B"])).map((entry) => [entry.url, entry.committedBlock]),
-    [["https://c.example.org", "bafyB"]],
+    (await resolver.resolve(["Nexus", "A"])).map((entry) => entry.url),
+    hosts,
   );
 });
 
@@ -369,18 +382,14 @@ test("a walk stops at its request budget however wide the declared tree is", asy
     requests += 1;
     const url = new URL(input);
     const path = (url.searchParams.get("chainPath") ?? "").split("/");
-    if (url.pathname === "/api/block/latest") {
-      return new Response(
-        JSON.stringify({ height: "1", hash: "bafytip", transactionCount: 0, timestamp: "1" }),
-      );
+    if (url.pathname === "/api/chain/genesis") {
+      return new Response(JSON.stringify({ genesisHash: NEXUS }));
     }
-    if (url.pathname.endsWith("/children")) {
+    if (url.pathname === "/api/chain/children") {
       return new Response(
         JSON.stringify({
-          children: Array.from({ length: 50 }, (_, index) => ({
-            directory: `c${index}`,
-            blockHash: "bafychild",
-          })),
+          chainPath: path,
+          directories: Array.from({ length: 50 }, (_, index) => `c${index}`),
         }),
       );
     }
@@ -394,13 +403,7 @@ test("a walk stops at its request budget however wide the declared tree is", asy
         }),
       );
     }
-    return new Response(
-      JSON.stringify({
-        ...JSON.parse(fixture("testnet-child-block.json")),
-        hash: "bafychild",
-        chain: path,
-      }),
-    );
+    return new Response(JSON.stringify({ chain: path, height: "1" }));
   };
   const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), {
     fetch,
@@ -439,4 +442,62 @@ test("the resolver's default fetch is called with a valid receiver", async () =>
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test("a directory listing naming another chain is refused", async () => {
+  const fetch = network({
+    [`${READ}/api/chain/children?chainPath=Nexus`]: JSON.stringify({
+      chainPath: ["Nexus", "other"],
+      directories: ["testnet"],
+    }),
+  });
+  await assert.rejects(
+    new NodeClient(READ, ["Nexus"], { fetch }).childDirectories(),
+    /different chainPath/,
+  );
+});
+
+test("hosts declared by several sources are asked once, in first-declared order, with submit merged", async () => {
+  const dialed: string[] = [];
+  const hosts = ["https://a.example.org", "https://b.example.org", "https://c.example.org"];
+  const fetch = network(
+    {
+      [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
+      ...declaring(READ, ["Nexus", "A"], ["https://s1.example.org", "https://s2.example.org"]),
+      ...serving("https://s1.example.org", ["Nexus", "A"]),
+      ...serving("https://s2.example.org", ["Nexus", "A"]),
+      ...declaring("https://s1.example.org", ["Nexus", "A", "B"], [hosts[1]!, hosts[0]!]),
+      [`https://s2.example.org/api/chain/endpoints?chainPath=Nexus%2FA%2FB`]: JSON.stringify({
+        chainPath: ["Nexus", "A", "B"],
+        committedBlock: null,
+        endpoints: [hosts[0], hosts[2], hosts[1]],
+        submitEndpoints: [hosts[1]],
+      }),
+      ...Object.assign({}, ...hosts.map((host) => serving(host, ["Nexus", "A", "B"]))),
+    },
+    dialed,
+  );
+  const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), {
+    fetch,
+    maximumCandidates: 2,
+  });
+  // b and a fill the two candidate slots; c is past the cap; s2's later
+  // mention of b still marks it as accepting submits.
+  assert.deepEqual(
+    (await resolver.resolve(["Nexus", "A", "B"])).map((entry) => [entry.url, entry.declaresSubmit]),
+    [
+      [hosts[1], true],
+      [hosts[0], false],
+    ],
+  );
+  for (const host of [hosts[0], hosts[1]]) {
+    assert.equal(
+      dialed.filter((key) => key === `${host}/api/chain/info?chainPath=Nexus%2FA%2FB`).length,
+      1,
+    );
+  }
+  assert.equal(
+    dialed.some((key) => key.startsWith(hosts[2]!)),
+    false,
+  );
 });
