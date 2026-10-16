@@ -2,6 +2,11 @@ import { EndpointResolver, type EndpointResolverOptions } from "./endpoints.js";
 import { NodeError } from "./http.js";
 import { type Fetch, NodeClient, normalizeNodeURL } from "./node-client.js";
 
+/** A 404 says the start node has nothing for this step: the chain's absence, not its failure. */
+function notFoundIsOffline(error: unknown): void {
+  if (!(error instanceof NodeError && error.status === 404)) throw error;
+}
+
 /** No node serves the chain, as far as the start node's directory says. */
 export class ChainOfflineError extends Error {
   readonly chainPath: readonly string[];
@@ -43,7 +48,9 @@ export interface ChainNodeFinderOptions {
  * concurrent callers; a found node is kept for `ttlMilliseconds`, then
  * searched again to follow the hosts as they come and go. {@link forget} a
  * node that failed: it is dropped, and tried after the others until the ttl
- * passes.
+ * passes. Forgetting the start node for a chain it serves sends the next
+ * searches to the chain's declared hosts until the ttl passes, back to the
+ * start node only when none is found.
  */
 export class ChainNodeFinder {
   readonly startURL: string;
@@ -101,15 +108,21 @@ export class ChainNodeFinder {
     if (current?.url !== node.url || current.found !== node.found) return;
     if (this.#searches.get(key) !== kept) return;
     this.#searches.delete(key);
-    if (node.found) this.#failed.set(`${key} ${node.url}`, this.#now() + this.#ttl);
+    this.#failed.set(`${key} ${node.url}`, this.#now() + this.#ttl);
   }
 
   async #search(chainPath: string[], key: string, entry: { until: number }): Promise<ChainNode> {
     const start = this.startURL;
-    if (await this.serves(start, chainPath)) return { url: start, found: false };
+    const fresh = (url: string) => !(this.#now() < (this.#failed.get(`${key} ${url}`) ?? 0));
+    const startServes = await this.serves(start, chainPath);
+    const itself = { url: start, found: false };
+    if (startServes && fresh(start)) return itself;
     let at = chainPath.slice(0, -1);
     while (at.length > 0 && !(await this.serves(start, at))) at = at.slice(0, -1);
-    if (at.length === 0) throw new ChainOfflineError(chainPath);
+    if (at.length === 0) {
+      if (startServes) return itself;
+      throw new ChainOfflineError(chainPath);
+    }
     const resolver = new EndpointResolver(new NodeClient(start, at, { fetch: this.#fetch }), {
       ...this.#resolver,
       fetch: this.#fetch,
@@ -117,8 +130,8 @@ export class ChainNodeFinder {
     const hosts = (await resolver.resolve(chainPath).catch(() => []))
       .map(({ url }) => url)
       .filter((url) => url !== start);
-    const fresh = (url: string) => !(this.#now() < (this.#failed.get(`${key} ${url}`) ?? 0));
     const url = hosts.find(fresh) ?? hosts[0];
+    if (url === undefined && startServes) return itself;
     if (url === undefined) {
       // Nothing found. If the start node's own part of the walk failed (its
       // network, or its directory for the first level), that is its failure,
@@ -127,10 +140,10 @@ export class ChainNodeFinder {
         new NodeClient(start, at, {
           fetch: this.#fetch,
           timeoutMilliseconds: this.#timeout,
-        }).nexusGenesis(),
-        resolver.declared(start, chainPath.slice(0, at.length + 1)).catch((error: unknown) => {
-          if (!(error instanceof NodeError && error.status === 404)) throw error;
-        }),
+        })
+          .nexusGenesis()
+          .catch(notFoundIsOffline),
+        resolver.declared(start, chainPath.slice(0, at.length + 1)).catch(notFoundIsOffline),
       ]);
       throw new ChainOfflineError(chainPath);
     }

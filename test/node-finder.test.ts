@@ -164,3 +164,23 @@ test("a start node failing during the search is its own failure, not offline", a
     ChainOfflineError,
   );
 });
+
+test("a forgotten start node sends the next search to declared hosts, until the ttl", async () => {
+  let clock = 0;
+  const finder = new ChainNodeFinder(START, {
+    fetch: network({ [START]: ["N", "N/x"], [host("a")]: ["N/x"] }, () => ({ "N/x": [host("a")] })),
+    ttlMilliseconds: 100,
+    now: () => clock,
+  });
+  const start = await finder.nodeFor(["N", "x"]);
+  assert.deepEqual(start, { url: START, found: false });
+  await finder.forget(["N", "x"], start);
+  assert.deepEqual(await finder.nodeFor(["N", "x"]), { url: host("a"), found: true });
+  clock = 150;
+  await finder.forget(["N", "x"], { url: host("a"), found: true });
+  assert.deepEqual(await finder.nodeFor(["N", "x"]), { url: START, found: false });
+  // No declared host: the start node it is, forgotten or not.
+  const alone = new ChainNodeFinder(START, { fetch: network({ [START]: ["N", "N/x"] }) });
+  await alone.forget(["N", "x"], await alone.nodeFor(["N", "x"]));
+  assert.deepEqual(await alone.nodeFor(["N", "x"]), { url: START, found: false });
+});
