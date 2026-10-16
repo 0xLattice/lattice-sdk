@@ -327,9 +327,13 @@ export class EndpointResolver {
     try {
       if (!(await this.#resolvesPublic(baseURL, signal))) return false;
       const client = this.#client(baseURL, chainPath, budget);
-      const info = await client.chainInfo(signal);
-      if (!samePath(info.chain, chainPath) || info.height === undefined) return false;
-      return (await client.nexusGenesis(signal)) === nexusGenesis;
+      const [info, genesis] = await Promise.all([
+        client.chainInfo(signal),
+        client.nexusGenesis(signal),
+      ]);
+      return (
+        samePath(info.chain, chainPath) && info.height !== undefined && genesis === nexusGenesis
+      );
     } catch {
       return false;
     }
@@ -421,7 +425,9 @@ export class EndpointResolver {
    * Breadth-first walk of the hosted tree below the root: children are the
    * directory names a source lists (`/api/chain/children`), bounded by depth,
    * per-chain child count, and the walk's request budget. Chains the budget
-   * does not reach are left out.
+   * does not reach are left out. The node's list only grows and is not paged,
+   * so past `maximumChildren` names, or a listing over `maximumResponseBytes`,
+   * some children are not reached; `resolve` a known path instead.
    */
   async tree(signal?: AbortSignal): Promise<ResolvedEndpoint[]> {
     const budget = new Budget(this.#maximumRequests);

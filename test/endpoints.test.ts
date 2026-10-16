@@ -311,8 +311,11 @@ test("the walk recurses through accepted hosts only, bounded and timed per reque
   );
   const probes = dialed.filter((key) => key.endsWith("/api/chain/info?chainPath=Nexus%2FA"));
   assert.equal(probes.length, 4);
-  // The slow host was never a source for the next level.
-  assert.equal(dialed.filter((key) => key.startsWith("https://slow.")).length, 1);
+  // The slow host was probed (chain info and genesis) but never a source for the next level.
+  assert.deepEqual(
+    dialed.filter((key) => key.startsWith("https://slow.")).map((key) => new URL(key).pathname),
+    ["/api/chain/info", "/api/chain/genesis"],
+  );
 
   await assert.rejects(resolver.resolve(["Nexus"]), /descendant/);
   await assert.rejects(resolver.resolve(["Other", "A"]), /descendant/);
@@ -451,5 +454,50 @@ test("a directory listing naming another chain is refused", async () => {
   await assert.rejects(
     new NodeClient(READ, ["Nexus"], { fetch }).childDirectories(),
     /different chainPath/,
+  );
+});
+
+test("hosts declared by several sources are asked once, in first-declared order, with submit merged", async () => {
+  const dialed: string[] = [];
+  const hosts = ["https://a.example.org", "https://b.example.org", "https://c.example.org"];
+  const fetch = network(
+    {
+      [`${READ}/api/chain/genesis?chainPath=Nexus`]: JSON.stringify({ genesisHash: NEXUS }),
+      ...declaring(READ, ["Nexus", "A"], ["https://s1.example.org", "https://s2.example.org"]),
+      ...serving("https://s1.example.org", ["Nexus", "A"]),
+      ...serving("https://s2.example.org", ["Nexus", "A"]),
+      ...declaring("https://s1.example.org", ["Nexus", "A", "B"], [hosts[1]!, hosts[0]!]),
+      [`https://s2.example.org/api/chain/endpoints?chainPath=Nexus%2FA%2FB`]: JSON.stringify({
+        chainPath: ["Nexus", "A", "B"],
+        committedBlock: null,
+        endpoints: [hosts[0], hosts[2], hosts[1]],
+        submitEndpoints: [hosts[1]],
+      }),
+      ...Object.assign({}, ...hosts.map((host) => serving(host, ["Nexus", "A", "B"]))),
+    },
+    dialed,
+  );
+  const resolver = new EndpointResolver(new NodeClient(READ, ["Nexus"], { fetch }), {
+    fetch,
+    maximumCandidates: 2,
+  });
+  // b and a fill the two candidate slots; c is past the cap; s2's later
+  // mention of b still marks it as accepting submits.
+  assert.deepEqual(
+    (await resolver.resolve(["Nexus", "A", "B"])).map((entry) => [entry.url, entry.declaresSubmit]),
+    [
+      [hosts[1], true],
+      [hosts[0], false],
+    ],
+  );
+  for (const host of [hosts[0], hosts[1]]) {
+    assert.equal(
+      dialed.filter((key) => key === `${host}/api/chain/info?chainPath=Nexus%2FA%2FB`).length,
+      1,
+    );
+  }
+  assert.equal(
+    dialed.some((key) => key.startsWith(hosts[2]!)),
+    false,
   );
 });
