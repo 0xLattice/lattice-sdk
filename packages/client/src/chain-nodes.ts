@@ -33,12 +33,6 @@ export interface ChainNodesOptions {
 }
 
 /**
- * Once one start node has answered, how long the others are waited for before
- * a list is made without them: one that hangs does not hold up the rest.
- */
-const START_GRACE_MILLISECONDS = 1_000;
-
-/**
  * The nodes that serve a chain: the start nodes (the ones the reader chose,
  * or an app's defaults) that serve the chain, then the hosts the chain's
  * rendezvous declares ({@link EndpointResolver}), walked down from the
@@ -54,10 +48,11 @@ const START_GRACE_MILLISECONDS = 1_000;
  *
  * A chain is offline ({@link ChainOfflineError}) only when the list is empty
  * and every start node answered. A start node failing while the list is made
- * (unreachable, or any answer but 404) is passed over while another answers;
- * when none does, or when the list would be empty without it, the failure is
- * thrown as is: it is the reader's nodes, not the chain, that failed. A list
- * is shared by concurrent callers and kept for `ttlMilliseconds`.
+ * (unreachable, or any answer but 404) is passed over while another answers,
+ * and is not walked from; when none does, or when the list would be empty
+ * without it, the failure is thrown as is: it is the reader's nodes, not the
+ * chain, that failed. A list is shared by concurrent callers and kept for
+ * `ttlMilliseconds`.
  */
 export class ChainNodes {
   readonly startURLs: readonly string[];
@@ -145,51 +140,25 @@ export class ChainNodes {
     }
   }
 
-  /**
-   * Which start nodes serve `chainPath`, asked together: `undefined` for one
-   * that failed, or had not answered within the grace once another had.
-   */
-  #startChecks(chainPath: readonly string[]): Promise<{ serves?: boolean; error?: unknown }[]> {
-    const checks: { serves?: boolean; error?: unknown }[] = this.startURLs.map(() => ({}));
-    return new Promise((done) => {
-      let settled = 0;
-      let grace: ReturnType<typeof setTimeout> | undefined;
-      this.startURLs.forEach((url, index) => {
-        this.#serves(url, chainPath)
-          .then(
-            (serves) => (checks[index] = { serves }),
-            (error: unknown) => (checks[index] = { error }),
-          )
-          .finally(() => {
-            settled += 1;
-            if (settled === checks.length) {
-              clearTimeout(grace);
-              done(checks);
-            } else if (grace === undefined && checks[index]!.serves !== undefined) {
-              grace = setTimeout(
-                () => done(checks.map((check) => ({ ...check }))),
-                START_GRACE_MILLISECONDS,
-              );
-            }
-          });
-      });
-    });
-  }
-
   async #list(chainPath: string[]): Promise<ChainNode[]> {
-    const checks = await this.#startChecks(chainPath);
-    const answered = checks.filter((check) => check.serves !== undefined);
-    const failure = checks.find((check) => check.serves === undefined);
-    if (answered.length === 0) throw failure!.error;
+    // Asked together, each within its timeout, like the hosts of any level.
+    const checks = await Promise.allSettled(
+      this.startURLs.map((url) => this.#serves(url, chainPath)),
+    );
+    const failure = checks.find((check) => check.status === "rejected");
+    if (checks.every((check) => check.status === "rejected")) throw failure!.reason;
     const own = this.startURLs
-      .filter((_, index) => checks[index]!.serves === true)
+      .filter((_, index) => {
+        const check = checks[index]!;
+        return check.status === "fulfilled" && check.value;
+      })
       .map((url) => ({ url, found: false }));
     const ownURLs = new Set(own.map(({ url }) => url));
     // When a start node serves the chain itself, failing to find others
     // costs only the fallbacks.
     const nodes = await this.#declared(
       chainPath,
-      this.startURLs.filter((_, index) => checks[index]!.serves !== undefined),
+      this.startURLs.filter((_, index) => checks[index]!.status === "fulfilled"),
     ).then(
       (found) => [...own, ...found.filter(({ url }) => !ownURLs.has(url))],
       (error: unknown) => {
@@ -198,32 +167,25 @@ export class ChainNodes {
       },
     );
     // Empty, but a start node did not answer: that may be the node serving it.
-    if (nodes.length === 0 && failure !== undefined) {
-      throw failure.error ?? new Error("start node did not answer in time");
-    }
+    if (nodes.length === 0 && failure !== undefined) throw failure.reason;
     return nodes;
   }
 
   /**
    * The declared hosts of `chainPath`, walked down from the nearest ancestor a
    * start node serves: the next of `starts` (those that just answered) in
-   * turn, then the others when one fails. Empty when a start node answered
-   * that it serves no ancestor and none could walk; thrown when every start
-   * node failed.
+   * turn, then the others when one fails. Empty only when every start node
+   * answered that it serves no ancestor; otherwise a failure is thrown.
    */
   async #declared(chainPath: string[], starts: readonly string[]): Promise<ChainNode[]> {
     const turn = this.#turn(JSON.stringify(chainPath), "walk");
-    let failure: unknown;
-    let answered = false;
+    let failure: { reason: unknown } | undefined;
     for (let step = 0; step < starts.length; step += 1) {
       const start = starts[(turn + step) % starts.length]!;
       try {
         let at = chainPath.slice(0, -1);
         while (at.length > 0 && !(await this.#serves(start, at))) at = at.slice(0, -1);
-        if (at.length === 0) {
-          answered = true;
-          continue;
-        }
+        if (at.length === 0) continue;
         const resolver = new EndpointResolver(new NodeClient(start, at, { fetch: this.#fetch }), {
           ...this.#resolver,
           fetch: this.#fetch,
@@ -231,10 +193,10 @@ export class ChainNodes {
         const hosts = await resolver.resolve(chainPath);
         return hosts.map(({ url }) => ({ url, found: true }));
       } catch (error) {
-        failure ??= error;
+        failure ??= { reason: error };
       }
     }
-    if (answered || failure === undefined) return [];
-    throw failure;
+    if (failure !== undefined) throw failure.reason;
+    return [];
   }
 }

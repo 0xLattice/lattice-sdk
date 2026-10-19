@@ -225,19 +225,52 @@ test("a start node whose check failed is kept when the walk finds it", async () 
   assert.deepEqual(await nodes.list(["N", "x"]), [{ url: s1, found: true }]);
 });
 
-test("a start node that hangs does not hold up the others", async () => {
+test("a start node that hangs is waited for only its timeout, and not walked from", async () => {
   const hang = host("hang");
-  const base = network({ [START]: ["N"] });
+  const dialed: string[] = [];
+  const base = network(
+    { [START]: ["N"], [host("a")]: ["N/x"] },
+    () => ({ "N/x": [host("a")] }),
+    dialed,
+  );
   const fetch = (input: string | URL, init?: RequestInit): Promise<Response> =>
     new URL(input).origin === hang
       ? new Promise((_, reject) =>
           init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)),
         )
       : base(input);
-  const nodes = new ChainNodes([hang, START], { fetch, timeoutMilliseconds: 60_000 });
-  const began = Date.now();
-  assert.deepEqual(await nodes.list(["N"]), [{ url: START, found: false }]);
-  assert.ok(Date.now() - began < 5_000);
+  const nodes = new ChainNodes([hang, START], { fetch, timeoutMilliseconds: 50, random: () => 0 });
+  assert.deepEqual(await nodes.list(["N", "x"]), [{ url: host("a"), found: true }]);
+  assert.ok(dialed.some((key) => key.startsWith(`${START}/api/chain/endpoints`)));
+});
+
+test("a slow start node that serves the chain is still listed", async () => {
+  const slow = host("slow");
+  const base = network({ [START]: [], [slow]: ["N"] });
+  const fetch = async (input: string | URL): Promise<Response> => {
+    if (new URL(input).origin === slow) await new Promise((done) => setTimeout(done, 1_200));
+    return base(input);
+  };
+  const nodes = new ChainNodes([START, slow], { fetch });
+  assert.deepEqual(await nodes.list(["N"]), [{ url: slow, found: false }]);
+});
+
+test("one start node's walk failing is not offline, though another serves no ancestor", async () => {
+  const [a, b] = [host("a"), host("b")];
+  const base = network({ [a]: [], [b]: [] });
+  const fetch = async (input: string | URL): Promise<Response> => {
+    const url = new URL(input);
+    if (url.origin === b && url.searchParams.get("chainPath") === "N") {
+      return new Response("{}", { status: 503 });
+    }
+    return base(input);
+  };
+  for (const random of [0, 0.5]) {
+    await assert.rejects(
+      new ChainNodes([a, b], { fetch, random: () => random }).read(["N", "x"], async () => 0),
+      { status: 503 },
+    );
+  }
 });
 
 test("every start node failing is the reader's failure", async () => {
