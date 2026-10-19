@@ -72,6 +72,7 @@ test("a read goes round the list until a node answers", async () => {
     fetch: network({ [START]: ["N", "N/x"], [host("a")]: ["N/x"], [host("b")]: ["N/x"] }, () => ({
       "N/x": [host("a"), host("b")],
     })),
+    random: () => 0,
   });
   const tried: string[] = [];
   const answer = await nodes.read(["N", "x"], async ({ url }) => {
@@ -91,19 +92,22 @@ test("a read goes round the list until a node answers", async () => {
 });
 
 test("reads take turns over the nodes, so each serves an even share", async () => {
-  const nodes = new ChainNodes(START, {
-    fetch: network(
-      { [START]: ["N"], [host("a")]: ["N/x"], [host("b")]: ["N/x"], [host("c")]: ["N/x"] },
-      () => ({
-        "N/x": [host("a"), host("b"), host("c")],
-      }),
-    ),
-  });
+  const fetch = network(
+    { [START]: ["N"], [host("a")]: ["N/x"], [host("b")]: ["N/x"], [host("c")]: ["N/x"] },
+    () => ({ "N/x": [host("a"), host("b"), host("c")] }),
+  );
+  const nodes = new ChainNodes(START, { fetch, random: () => 0 });
   const served: string[] = [];
   for (let i = 0; i < 6; i += 1) served.push(await nodes.read(["N", "x"], async ({ url }) => url));
   assert.deepEqual(served, [host("a"), host("b"), host("c"), host("a"), host("b"), host("c")]);
   // Each chain keeps its own turn.
   assert.equal(await nodes.read(["N"], async ({ url }) => url), START);
+  // Readers begin at a random node, so many fresh readers spread too.
+  const nodesAt = (random: number) => new ChainNodes(START, { fetch, random: () => random });
+  const firsts = new Set<string>();
+  for (const random of [0, 1 / 3, 2 / 3])
+    firsts.add(await nodesAt(random).read(["N", "x"], async ({ url }) => url));
+  assert.equal(firsts.size, 3);
 });
 
 test("several start nodes are one level like any other", async () => {
@@ -115,6 +119,7 @@ test("several start nodes are one level like any other", async () => {
       () => ({ "N/x": [host("a")] }),
       dialed,
     ),
+    random: () => 0,
   });
   // A start node that is down is passed over; the rest share Nexus reads.
   assert.deepEqual(await nodes.list(["N"]), [
@@ -124,28 +129,115 @@ test("several start nodes are one level like any other", async () => {
   const served: string[] = [];
   for (let i = 0; i < 4; i += 1) served.push(await nodes.read(["N"], async ({ url }) => url));
   assert.deepEqual(served, [one, three, one, three]);
-  // A child is found from a start node that answers: this walk's turn falls
-  // on `two`, which is down, so it goes on to `three`.
+  // A child is found from a start node that answers; the one that is down is
+  // not walked from.
+  dialed.length = 0;
   assert.deepEqual(await nodes.list(["N", "x"]), [{ url: host("a"), found: true }]);
-  assert.ok(dialed.some((key) => key.startsWith(`${three}/api/chain/endpoints`)));
+  assert.ok(dialed.some((key) => key.startsWith(`${one}/api/chain/endpoints`)));
+  assert.ok(!dialed.some((key) => key.startsWith(`${two}/api/chain/endpoints`)));
 });
 
-test("each walk down begins at the next start node", async () => {
+test("each walk down a chain begins at the next start node", async () => {
   const [one, two] = [host("one"), host("two")];
   const dialed: string[] = [];
+  let clock = 0;
   const nodes = new ChainNodes([one, two], {
     fetch: network(
-      { [one]: ["N"], [two]: ["N"], [host("a")]: ["N/x", "N/y"] },
-      () => ({ "N/x": [host("a")], "N/y": [host("a")] }),
+      { [one]: ["N"], [two]: ["N"], [host("a")]: ["N/x"] },
+      () => ({ "N/x": [host("a")] }),
       dialed,
     ),
+    random: () => 0,
+    ttlMilliseconds: 100,
+    now: () => clock,
   });
   await nodes.list(["N", "x"]);
-  await nodes.list(["N", "y"]);
+  clock = 150;
+  await nodes.list(["N", "x"]);
   const walkedFrom = dialed
     .filter((key) => key.includes("/api/chain/endpoints"))
     .map((key) => new URL(key.split(" ")[0]!).origin);
   assert.deepEqual(walkedFrom, [one, two]);
+});
+
+test("a chain is offline only when every start node answered", async () => {
+  let down = true;
+  const serves = { [host("one")]: ["M"], [host("two")]: ["M"] } as Record<
+    string,
+    string[] | "down"
+  >;
+  const base = network(serves);
+  const fetch = (input: string | URL) => {
+    serves[host("one")] = down ? "down" : ["M"];
+    return base(input);
+  };
+  const nodes = new ChainNodes([host("one"), host("two")], { fetch, random: () => 0 });
+  // `one` might be the node that serves it: its failure is thrown, not kept.
+  await assert.rejects(
+    nodes.read(["N", "x"], async () => 0),
+    TypeError,
+  );
+  down = false;
+  await assert.rejects(
+    nodes.read(["N", "x"], async () => 0),
+    ChainOfflineError,
+  );
+});
+
+test("a start node failing is not kept as the chain being offline", async () => {
+  let busy = true;
+  const s1 = host("s1");
+  const s2 = host("s2");
+  const base = network({ [s1]: ["N", "N/x"], [s2]: ["N"] }, () => ({ "N/x": [s1] }));
+  const fetch = async (input: string | URL): Promise<Response> => {
+    const url = new URL(input);
+    if (busy && url.origin === s1 && url.searchParams.get("chainPath") === "N/x") {
+      return new Response("{}", { status: 503 });
+    }
+    return base(input);
+  };
+  const nodes = new ChainNodes([s1, s2], { fetch, random: () => 0 });
+  await assert.rejects(nodes.list(["N", "x"]), { status: 503 });
+  busy = false;
+  // Not kept: the next list finds it.
+  assert.deepEqual(await nodes.list(["N", "x"]), [{ url: s1, found: false }]);
+});
+
+test("a start node whose check failed is kept when the walk finds it", async () => {
+  const s1 = host("s1");
+  const s2 = host("s2");
+  let checks = 0;
+  const base = network({ [s1]: ["N", "N/x"], [s2]: ["N"] }, () => ({ "N/x": [s1] }));
+  const fetch = async (input: string | URL): Promise<Response> => {
+    const url = new URL(input);
+    // s1's first answer for N/x (the start check) fails; later ones answer.
+    if (
+      url.origin === s1 &&
+      url.pathname === "/api/chain/info" &&
+      url.searchParams.get("chainPath") === "N/x"
+    ) {
+      checks += 1;
+      if (checks === 1) return new Response("{}", { status: 503 });
+    }
+    return base(input);
+  };
+  const nodes = new ChainNodes([s1, s2], { fetch, random: () => 0.5 });
+  assert.deepEqual(await nodes.list(["N", "x"]), [{ url: s1, found: true }]);
+});
+
+test("a start node that hangs does not hold up the others", async () => {
+  const hang = host("hang");
+  const base = network({ [START]: ["N"] });
+  const fetch = (input: string | URL, init?: RequestInit): Promise<Response> =>
+    new URL(input).origin === hang
+      ? new Promise((_, reject) =>
+          init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)),
+        )
+      : base(input);
+  const nodes = new ChainNodes([hang, START], { fetch, timeoutMilliseconds: 60_000 });
+  const began = Date.now();
+  assert.deepEqual(await nodes.list(["N"]), [{ url: START, found: false }]);
+  assert.ok(Date.now() - began < 5_000);
 });
 
 test("every start node failing is the reader's failure", async () => {
