@@ -41,7 +41,7 @@ function network(
   };
 }
 
-test("the start node comes first, then the declared hosts in order", async () => {
+test("the list is the start node, then the declared hosts in order", async () => {
   const nodes = new ChainNodes(START, {
     fetch: network({ [START]: ["N", "N/x"], [host("a")]: ["N/x"], [host("b")]: ["N/x"] }, () => ({
       "N/x": [host("a"), START, host("b")],
@@ -67,7 +67,7 @@ test("a chain the start node lacks is found from its nearest served ancestor, at
   assert.ok(dialed.includes(`${START}/api/chain/endpoints N/S/c`));
 });
 
-test("a read goes down the list until a node answers", async () => {
+test("a read goes round the list until a node answers", async () => {
   const nodes = new ChainNodes(START, {
     fetch: network({ [START]: ["N", "N/x"], [host("a")]: ["N/x"], [host("b")]: ["N/x"] }, () => ({
       "N/x": [host("a"), host("b")],
@@ -81,11 +81,79 @@ test("a read goes down the list until a node answers", async () => {
   });
   assert.equal(answer, "read");
   assert.deepEqual(tried, [START, host("a"), host("b")]);
+  // The next read begins one further on, and ends on the last it tried.
   await assert.rejects(
     nodes.read(["N", "x"], async ({ url }) => {
       throw new Error(`${url} failed`);
     }),
-    /b\.example\.org failed/,
+    /start\.example\.org failed/,
+  );
+});
+
+test("reads take turns over the nodes, so each serves an even share", async () => {
+  const nodes = new ChainNodes(START, {
+    fetch: network(
+      { [START]: ["N"], [host("a")]: ["N/x"], [host("b")]: ["N/x"], [host("c")]: ["N/x"] },
+      () => ({
+        "N/x": [host("a"), host("b"), host("c")],
+      }),
+    ),
+  });
+  const served: string[] = [];
+  for (let i = 0; i < 6; i += 1) served.push(await nodes.read(["N", "x"], async ({ url }) => url));
+  assert.deepEqual(served, [host("a"), host("b"), host("c"), host("a"), host("b"), host("c")]);
+  // Each chain keeps its own turn.
+  assert.equal(await nodes.read(["N"], async ({ url }) => url), START);
+});
+
+test("several start nodes are one level like any other", async () => {
+  const [one, two, three] = [host("one"), host("two"), host("three")];
+  const dialed: string[] = [];
+  const nodes = new ChainNodes([one, two, three], {
+    fetch: network(
+      { [one]: ["N"], [two]: "down", [three]: ["N"], [host("a")]: ["N/x"] },
+      () => ({ "N/x": [host("a")] }),
+      dialed,
+    ),
+  });
+  // A start node that is down is passed over; the rest share Nexus reads.
+  assert.deepEqual(await nodes.list(["N"]), [
+    { url: one, found: false },
+    { url: three, found: false },
+  ]);
+  const served: string[] = [];
+  for (let i = 0; i < 4; i += 1) served.push(await nodes.read(["N"], async ({ url }) => url));
+  assert.deepEqual(served, [one, three, one, three]);
+  // A child is found from a start node that answers: this walk's turn falls
+  // on `two`, which is down, so it goes on to `three`.
+  assert.deepEqual(await nodes.list(["N", "x"]), [{ url: host("a"), found: true }]);
+  assert.ok(dialed.some((key) => key.startsWith(`${three}/api/chain/endpoints`)));
+});
+
+test("each walk down begins at the next start node", async () => {
+  const [one, two] = [host("one"), host("two")];
+  const dialed: string[] = [];
+  const nodes = new ChainNodes([one, two], {
+    fetch: network(
+      { [one]: ["N"], [two]: ["N"], [host("a")]: ["N/x", "N/y"] },
+      () => ({ "N/x": [host("a")], "N/y": [host("a")] }),
+      dialed,
+    ),
+  });
+  await nodes.list(["N", "x"]);
+  await nodes.list(["N", "y"]);
+  const walkedFrom = dialed
+    .filter((key) => key.includes("/api/chain/endpoints"))
+    .map((key) => new URL(key.split(" ")[0]!).origin);
+  assert.deepEqual(walkedFrom, [one, two]);
+});
+
+test("every start node failing is the reader's failure", async () => {
+  await assert.rejects(
+    new ChainNodes([host("one"), host("two")], {
+      fetch: network({ [host("one")]: "down", [host("two")]: "busy" }),
+    }).list(["N"]),
+    TypeError,
   );
 });
 
