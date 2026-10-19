@@ -174,8 +174,9 @@ export class ChainNodes {
   /**
    * The declared hosts of `chainPath`, walked down from the nearest ancestor a
    * start node serves: the next of `starts` (those that just answered) in
-   * turn, then the others when one fails. Empty only when every start node
-   * answered that it serves no ancestor; otherwise a failure is thrown.
+   * turn, then the others when one fails. Empty only when no start node
+   * failed: one answered that the chain has no hosts, or every one that it
+   * serves no ancestor. Otherwise a failure is thrown.
    */
   async #declared(chainPath: string[], starts: readonly string[]): Promise<ChainNode[]> {
     const turn = this.#turn(JSON.stringify(chainPath), "walk");
@@ -191,7 +192,11 @@ export class ChainNodes {
           fetch: this.#fetch,
         });
         const hosts = await resolver.resolve(chainPath);
-        return hosts.map(({ url }) => ({ url, found: true }));
+        // An empty answer after another start node failed does not show the
+        // chain is offline: that node's directory may hold its hosts.
+        if (hosts.length > 0 || failure === undefined) {
+          return hosts.map(({ url }) => ({ url, found: true }));
+        }
       } catch (error) {
         failure ??= { reason: error };
       }

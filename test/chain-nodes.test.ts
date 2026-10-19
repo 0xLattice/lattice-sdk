@@ -273,6 +273,23 @@ test("one start node's walk failing is not offline, though another serves no anc
   }
 });
 
+test("an empty walk after another start node's walk failed is not offline", async () => {
+  const [one, two] = [host("one"), host("two")];
+  const base = network({ [one]: ["N"], [two]: ["N"] }, () => ({ "N/x": [] }));
+  const fetch = async (input: string | URL): Promise<Response> => {
+    const url = new URL(input);
+    if (url.origin === one && url.pathname === "/api/chain/endpoints") {
+      return new Response("{}", { status: 503 });
+    }
+    return base(input);
+  };
+  const nodes = new ChainNodes([one, two], { fetch, random: () => 0 });
+  await assert.rejects(
+    nodes.read(["N", "x"], async () => 0),
+    { status: 503 },
+  );
+});
+
 test("every start node failing is the reader's failure", async () => {
   await assert.rejects(
     new ChainNodes([host("one"), host("two")], {
