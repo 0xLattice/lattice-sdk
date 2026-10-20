@@ -1,5 +1,5 @@
 {
-  "name": "@adalinxx/lattice-client",
+  "name": "@adalin/lattice-client",
   "version": "0.1.0",
   "type": "module",
   "description": "Read-only Lattice node client composed with verified Volume retrieval",
@@ -11,7 +11,8 @@
   },
   "sideEffects": false,
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "exports": {
     ".": {
@@ -23,7 +24,10 @@
     "access": "public"
   },
   "dependencies": {
-    "@adalinxx/lattice-core": "0.1.0",
-    "@adalinxx/lattice-volumes": "0.1.0"
+    "@adalin/lattice-core": "0.1.0",
+    "@adalin/lattice-volumes": "0.1.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

@@ -9,7 +9,7 @@ import {
   decodeCanonicalLatticeState,
   encodeDagCbor,
   workForTarget,
-} from "@adalinxx/lattice-core";
+} from "@adalin/lattice-core";
 import {
   decodeVolumeArchive,
   encodeVolumeArchive,
@@ -20,7 +20,7 @@ import {
   VolumeError,
   VolumeTransportError,
   verifyVolume,
-} from "@adalinxx/lattice-volumes";
+} from "@adalin/lattice-volumes";
 
 function rawArchive(entries: readonly { cid: string; bytes: Uint8Array }[]): Uint8Array {
   const encoder = new TextEncoder();

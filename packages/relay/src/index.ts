@@ -1,4 +1,4 @@
-import type { TransactionPayload } from "@adalinxx/lattice-core";
+import type { TransactionPayload } from "@adalin/lattice-core";
 
 export interface SubmitResult {
   readonly transactionCID: string;

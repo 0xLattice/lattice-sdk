@@ -23,8 +23,8 @@ import {
   utf8,
   verifyPreimage,
   type DagCborValue,
-} from "@adalinxx/lattice-core";
-import { verifyUint64SparseProof } from "@adalinxx/lattice-volumes";
+} from "@adalin/lattice-core";
+import { verifyUint64SparseProof } from "@adalin/lattice-volumes";
 
 const vectorDirectory = new URL("../.cache/lattice-vectors/", import.meta.url);
 const load = (name: string): any =>

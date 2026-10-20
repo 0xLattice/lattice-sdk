@@ -1,5 +1,11 @@
 # Lattice SDK
 
+Requires Node.js 22 or later. Packages provide ESM and TypeScript declarations; CommonJS `require()` is not supported.
+
+```sh
+npm install @adalin/lattice-sdk
+```
+
 ### Low-level JSON transport
 
 `getJSON(url, options)` accepts an options object with `fetch`, `signal`,
@@ -42,12 +48,12 @@ lattice-sdk          application-facing composition of those capabilities
 
 The SDK deliberately separates three capabilities:
 
-1. **Read plane:** `@adalinxx/lattice-client` reads the node's unversioned,
+1. **Read plane:** `@adalin/lattice-client` reads the node's unversioned,
    public, read-only JSON API. Consensus integers become JavaScript `bigint`s.
-2. **Content plane:** `@adalinxx/lattice-volumes` accepts a content-service or
+2. **Content plane:** `@adalin/lattice-volumes` accepts a content-service or
    DHT transport and validates every member of each complete Volume against its
    CID before exposing it.
-3. **Submission plane:** `@adalinxx/lattice-relay` submits only through an
+3. **Submission plane:** `@adalin/lattice-relay` submits only through an
    application-selected third-party relay or private node. The read client has
    no submission method.
 
@@ -58,13 +64,13 @@ references.
 
 ## Packages
 
-| Package                     | Responsibility                                                       |
-| --------------------------- | -------------------------------------------------------------------- |
-| `@adalinxx/lattice-core`    | DAG-CBOR, CIDs, addresses, Ed25519 signing, transaction construction |
-| `@adalinxx/lattice-volumes` | Complete-Volume transport interface, bounds, and CID verification    |
-| `@adalinxx/lattice-client`  | Read-only node API and node/content composition                      |
-| `@adalinxx/lattice-relay`   | Explicit relay or private-node submission                            |
-| `@adalinxx/lattice-sdk`     | Convenience re-export of the four packages                           |
+| Package                   | Responsibility                                                       |
+| ------------------------- | -------------------------------------------------------------------- |
+| `@adalin/lattice-core`    | DAG-CBOR, CIDs, addresses, Ed25519 signing, transaction construction |
+| `@adalin/lattice-volumes` | Complete-Volume transport interface, bounds, and CID verification    |
+| `@adalin/lattice-client`  | Read-only node API and node/content composition                      |
+| `@adalin/lattice-relay`   | Explicit relay or private-node submission                            |
+| `@adalin/lattice-sdk`     | Convenience re-export of the four packages                           |
 
 Releases publish all five packages together with npm provenance. See
 [`docs/getting-started.md`](docs/getting-started.md) for the application setup
@@ -74,12 +80,7 @@ content bridge contract.
 ## Example
 
 ```ts
-import {
-  HTTPVolumeTransport,
-  LatticeClient,
-  NodeClient,
-  VolumeClient,
-} from "@adalinxx/lattice-sdk";
+import { HTTPVolumeTransport, LatticeClient, NodeClient, VolumeClient } from "@adalin/lattice-sdk";
 
 const content = new HTTPVolumeTransport("https://content.example.org/volumes");
 
@@ -101,7 +102,7 @@ import {
   signTransactionBody,
   signedTransactionCID,
   transactionPayload,
-} from "@adalinxx/lattice-sdk";
+} from "@adalin/lattice-sdk";
 
 const body = buildTransfer({
   from,

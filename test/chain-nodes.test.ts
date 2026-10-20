@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { ChainNodes, ChainOfflineError } from "@adalinxx/lattice-client";
+import { ChainNodes, ChainOfflineError } from "@adalin/lattice-client";
 
 const NEXUS = "bafynexusgenesis";
 const START = "https://start.example.org";
@@ -235,9 +235,14 @@ test("a start node that hangs is waited for only its timeout, and not walked fro
   );
   const fetch = (input: string | URL, init?: RequestInit): Promise<Response> =>
     new URL(input).origin === hang
-      ? new Promise((_, reject) =>
-          init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)),
-        )
+      ? new Promise((_, reject) => {
+          // AbortSignal.timeout does not keep Node alive; model an open request.
+          const alive = setInterval(() => {}, 1_000);
+          init?.signal?.addEventListener("abort", () => {
+            clearInterval(alive);
+            reject(init.signal!.reason);
+          });
+        })
       : base(input);
   const nodes = new ChainNodes([hang, START], { fetch, timeoutMilliseconds: 50, random: () => 0 });
   assert.deepEqual(await nodes.list(["N", "x"]), [{ url: host("a"), found: true }]);

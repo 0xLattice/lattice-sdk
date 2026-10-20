@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { normalizeNodeURL, declaredEndpointURL, getJSON } from "@adalinxx/lattice-client";
-import { encodeDagCbor, decodeDagCbor } from "@adalinxx/lattice-core";
+import { normalizeNodeURL, declaredEndpointURL, getJSON } from "@adalin/lattice-client";
+import { encodeDagCbor, decodeDagCbor } from "@adalin/lattice-core";
 
 test("empty query and fragment delimiters cannot control node route suffixes", () => {
   for (const url of [

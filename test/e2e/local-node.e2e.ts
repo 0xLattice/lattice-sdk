@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { promisify } from "node:util";
 
-import { LatticeClient, NodeClient } from "@adalinxx/lattice-client";
+import { LatticeClient, NodeClient } from "@adalin/lattice-client";
 import {
   accountFromPrivateKey,
   buildTransfer,
@@ -22,9 +22,9 @@ import {
   signTransactionBody,
   transactionPayload,
   type TransactionBody,
-} from "@adalinxx/lattice-core";
-import { HTTPTransactionSubmitter, SubmissionError } from "@adalinxx/lattice-relay";
-import { HTTPVolumeTransport, VolumeClient } from "@adalinxx/lattice-volumes";
+} from "@adalin/lattice-core";
+import { HTTPTransactionSubmitter, SubmissionError } from "@adalin/lattice-relay";
+import { HTTPVolumeTransport, VolumeClient } from "@adalin/lattice-volumes";
 
 const bin = process.env.LATTICE_NODE_BIN;
 if (bin === undefined)

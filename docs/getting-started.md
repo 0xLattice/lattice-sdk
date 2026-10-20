@@ -3,18 +3,13 @@
 Install the composed package or only the capabilities your application needs:
 
 ```sh
-npm install @adalinxx/lattice-sdk
+npm install @adalin/lattice-sdk
 ```
 
 ## Verified reads
 
 ```ts
-import {
-  HTTPVolumeTransport,
-  LatticeClient,
-  NodeClient,
-  VolumeClient,
-} from "@adalinxx/lattice-sdk";
+import { HTTPVolumeTransport, LatticeClient, NodeClient, VolumeClient } from "@adalin/lattice-sdk";
 
 const lattice = new LatticeClient(
   new NodeClient("https://reads.example.org", ["Nexus"]),

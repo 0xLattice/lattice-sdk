@@ -1,4 +1,4 @@
-import { assertCID, decodeDagCbor, type DagCborValue } from "@adalinxx/lattice-core";
+import { assertCID, decodeDagCbor, type DagCborValue } from "@adalin/lattice-core";
 
 export interface VolumeEntry {
   readonly cid: string;
