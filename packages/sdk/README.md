@@ -1,16 +1,17 @@
-# @adalinxx/lattice-sdk
+# @adalin/lattice-sdk
+
+Requires Node.js 22 or later. This package provides ESM and TypeScript declarations; CommonJS `require()` is not supported.
+
+```sh
+npm install @adalin/lattice-sdk
+```
 
 The complete TypeScript developer SDK for Lattice. It re-exports canonical
 primitives, verified complete-Volume retrieval, read-only node access, and
 explicit relay/private-node submission.
 
 ```ts
-import {
-  HTTPVolumeTransport,
-  LatticeClient,
-  NodeClient,
-  VolumeClient,
-} from "@adalinxx/lattice-sdk";
+import { HTTPVolumeTransport, LatticeClient, NodeClient, VolumeClient } from "@adalin/lattice-sdk";
 
 const client = new LatticeClient(
   new NodeClient("https://reads.example.org", ["Nexus"]),

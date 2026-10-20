@@ -1,5 +1,5 @@
 {
-  "name": "@adalinxx/lattice-relay",
+  "name": "@adalin/lattice-relay",
   "version": "0.1.0",
   "type": "module",
   "description": "Explicit relay and private-node transaction submission transports for Lattice",
@@ -11,7 +11,8 @@
   },
   "sideEffects": false,
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "exports": {
     ".": {
@@ -23,6 +24,9 @@
     "access": "public"
   },
   "dependencies": {
-    "@adalinxx/lattice-core": "0.1.0"
+    "@adalin/lattice-core": "0.1.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

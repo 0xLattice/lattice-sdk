@@ -6,8 +6,8 @@ import {
   type CanonicalBlock,
   type CanonicalLatticeState,
   type CanonicalSignedTransaction,
-} from "@adalinxx/lattice-core";
-import { type VerifiedVolume, VolumeClient } from "@adalinxx/lattice-volumes";
+} from "@adalin/lattice-core";
+import { type VerifiedVolume, VolumeClient } from "@adalin/lattice-volumes";
 import { type BlockView, type TransactionProjection } from "./models.js";
 import { NodeClient } from "./node-client.js";
 

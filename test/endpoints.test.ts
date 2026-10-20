@@ -7,7 +7,7 @@ import {
   NodeClient,
   OPERATOR_DECLARED,
   declaredEndpointURL,
-} from "@adalinxx/lattice-client";
+} from "@adalin/lattice-client";
 
 const fixture = (name: string): string =>
   readFileSync(new URL(`fixtures/live/${name}`, import.meta.url), "utf8");

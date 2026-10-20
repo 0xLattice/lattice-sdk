@@ -1,5 +1,5 @@
 {
-  "name": "@adalinxx/lattice-sdk",
+  "name": "@adalin/lattice-sdk",
   "version": "0.1.0",
   "type": "module",
   "description": "Developer SDK for the Lattice network",
@@ -11,7 +11,8 @@
   },
   "sideEffects": false,
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "exports": {
     ".": {
@@ -23,9 +24,12 @@
     "access": "public"
   },
   "dependencies": {
-    "@adalinxx/lattice-client": "0.1.0",
-    "@adalinxx/lattice-core": "0.1.0",
-    "@adalinxx/lattice-relay": "0.1.0",
-    "@adalinxx/lattice-volumes": "0.1.0"
+    "@adalin/lattice-client": "0.1.0",
+    "@adalin/lattice-core": "0.1.0",
+    "@adalin/lattice-relay": "0.1.0",
+    "@adalin/lattice-volumes": "0.1.0"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

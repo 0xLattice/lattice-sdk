@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { LatticeClient, NodeClient } from "@adalinxx/lattice-client";
+import { LatticeClient, NodeClient } from "@adalin/lattice-client";
 import {
   cidV1DagCbor,
   encodeDagCbor,
   encodeSignedTransaction,
   encodeTransactionBody,
-} from "@adalinxx/lattice-core";
-import { MemoryVolumeTransport, VolumeClient } from "@adalinxx/lattice-volumes";
+} from "@adalin/lattice-core";
+import { MemoryVolumeTransport, VolumeClient } from "@adalin/lattice-volumes";
 
 function json(value: unknown): Response {
   return new Response(JSON.stringify(value), {

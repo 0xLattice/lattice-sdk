@@ -28,11 +28,11 @@ jobs:
       - run: npm run test:package
       # Dependency order matters for a new release. Authentication is npm's
       # GitHub OIDC trusted publishing; no long-lived npm token is stored.
-      - run: npm publish --workspace @adalinxx/lattice-core --provenance --access public
-      - run: npm publish --workspace @adalinxx/lattice-volumes --provenance --access public
-      - run: npm publish --workspace @adalinxx/lattice-client --provenance --access public
-      - run: npm publish --workspace @adalinxx/lattice-relay --provenance --access public
-      - run: npm publish --workspace @adalinxx/lattice-sdk --provenance --access public
+      - run: npm publish --workspace @adalin/lattice-core --provenance --access public
+      - run: npm publish --workspace @adalin/lattice-volumes --provenance --access public
+      - run: npm publish --workspace @adalin/lattice-client --provenance --access public
+      - run: npm publish --workspace @adalin/lattice-relay --provenance --access public
+      - run: npm publish --workspace @adalin/lattice-sdk --provenance --access public
       - env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes

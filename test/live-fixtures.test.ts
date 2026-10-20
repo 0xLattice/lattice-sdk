@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { NodeClient } from "@adalinxx/lattice-client";
+import { NodeClient } from "@adalin/lattice-client";
 
 // Bodies captured verbatim with read-only GETs from the public read replica
 // (lattice-mainnet-read.fly.dev) and the testnet follower

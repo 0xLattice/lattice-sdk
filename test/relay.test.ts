@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { buildTransfer, transactionPayload, type TransactionPayload } from "@adalinxx/lattice-core";
+import { buildTransfer, transactionPayload, type TransactionPayload } from "@adalin/lattice-core";
 import {
   HTTPTransactionSubmitter,
   SUBMISSION_REFUSALS,
   SubmissionError,
-} from "@adalinxx/lattice-relay";
+} from "@adalin/lattice-relay";
 
 test("submission is explicit and preserves integers as decimal strings", async () => {
   let submitted: TransactionPayload | undefined;

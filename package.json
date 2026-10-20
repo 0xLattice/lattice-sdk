@@ -18,7 +18,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "npm run vectors:fetch && npm run build && tsx --test test/*.test.ts",
-    "test:package": "npm pack --dry-run --json --workspaces",
+    "test:package": "npm run build && npm pack --dry-run --json --workspaces",
     "typecheck": "tsc -b --pretty false",
     "vectors:fetch": "node scripts/fetch-vectors.mjs",
     "vectors:update": "node scripts/update-vector-lock.mjs",

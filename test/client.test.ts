@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { NodeClient } from "@adalinxx/lattice-client";
-import { nodeCookieAuthorization } from "@adalinxx/lattice-core";
+import { NodeClient } from "@adalin/lattice-client";
+import { nodeCookieAuthorization } from "@adalin/lattice-core";
 
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
