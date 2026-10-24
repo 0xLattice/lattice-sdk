@@ -1,5 +1,8 @@
 # Lattice SDK
 
+Read the documentation at [lattice.build/docs](https://lattice.build/docs/build/getting-started/). This repository's
+pages there are published from its Markdown; edit them here.
+
 Requires Node.js 22 or later. Packages provide ESM and TypeScript declarations; CommonJS `require()` is not supported.
 
 ```sh
