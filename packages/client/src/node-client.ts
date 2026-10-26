@@ -4,6 +4,8 @@ import {
   type BlocksPage,
   type BlockView,
   type ChainInfo,
+  type ChainSpec,
+  type FeeEstimates,
   type LatestBlockView,
   type NodeStatus,
   type TransactionProjection,
@@ -12,6 +14,8 @@ import {
   parseBlockChildren,
   parseBlocksPage,
   parseChainInfo,
+  parseChainSpec,
+  parseFeeEstimates,
   parseLatestBlock,
   parseNodeStatus,
   parseTransactionProjection,
@@ -252,6 +256,19 @@ export class NodeClient {
 
   chainInfo(signal?: AbortSignal): Promise<ChainInfo> {
     return this.#request("/api/chain/info", parseChainInfo, signal) as Promise<ChainInfo>;
+  }
+
+  /** The chain's consensus parameters (`GET /api/chain/spec`). */
+  chainSpec(signal?: AbortSignal): Promise<ChainSpec> {
+    return this.#request("/api/chain/spec", parseChainSpec, signal) as Promise<ChainSpec>;
+  }
+
+  /**
+   * The blocks this node's pool would fill next (`GET /api/fees`), for fee
+   * pricing. Nodes older than the route answer 404 (`NodeError`).
+   */
+  fees(signal?: AbortSignal): Promise<FeeEstimates> {
+    return this.#request("/api/fees", parseFeeEstimates, signal) as Promise<FeeEstimates>;
   }
 
   mempool(

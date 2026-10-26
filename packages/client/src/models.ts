@@ -307,3 +307,90 @@ export function parseBlockChildren(value: unknown): BlockChild[] {
     };
   });
 }
+
+/** One block of `GET /api/fees`: what this node's pool would put in it. */
+export interface ProjectedBlock {
+  readonly transactionCount: number;
+  readonly bytes: number;
+  /**
+   * The block's lowest rate, `lowestFee` over `lowestFeeBytes`: a transaction
+   * paying a higher rate would have been taken before it.
+   */
+  readonly lowestFee: bigint;
+  readonly lowestFeeBytes: number;
+  /** Whether ready transactions were left for a later block. */
+  readonly full: boolean;
+}
+
+/**
+ * `GET /api/fees`: the blocks this node's pool would fill next, in order.
+ * No block, or a first block that is not `full`, means the next block has
+ * room: any fee at `minRelayFee` makes it. An estimate from one node's pool,
+ * not a promise: other miners' pools and later arrivals differ.
+ */
+export interface FeeEstimates {
+  /** This node's relay floor (policy, never consensus), as in chain info. */
+  readonly minRelayFee: bigint;
+  readonly blocks: readonly ProjectedBlock[];
+}
+
+export function parseFeeEstimates(value: unknown): FeeEstimates {
+  const body = record(value, "fees");
+  return {
+    minRelayFee: decimal(body.minRelayFee, "fees.minRelayFee"),
+    blocks: array(body.blocks, "fees.blocks", (entry, name) => {
+      const block = record(entry, name);
+      const lowestFeeBytes = integer(block.lowestFeeBytes, `${name}.lowestFeeBytes`);
+      if (lowestFeeBytes <= 0) throw new TypeError(`${name}.lowestFeeBytes must be positive`);
+      const full = optionalBoolean(block.full, `${name}.full`);
+      if (full === undefined) throw new TypeError(`${name}.full must be a boolean`);
+      return {
+        transactionCount: integer(block.transactionCount, `${name}.transactionCount`),
+        bytes: integer(block.bytes, `${name}.bytes`),
+        lowestFee: decimal(block.lowestFee, `${name}.lowestFee`),
+        lowestFeeBytes,
+        full,
+      };
+    }),
+  };
+}
+
+/**
+ * The smallest fee for a transaction of `size` bytes to rank ahead of
+ * `block`'s lowest-rate package, and so be taken into that block or an
+ * earlier one: a rate strictly above `lowestFee / lowestFeeBytes` (equal
+ * rates break by CID, which a sender does not choose).
+ */
+export function feeToOutbid(block: ProjectedBlock, size: number): bigint {
+  if (!Number.isSafeInteger(size) || size <= 0)
+    throw new RangeError("size must be a positive integer");
+  return (block.lowestFee * BigInt(size)) / BigInt(block.lowestFeeBytes) + 1n;
+}
+
+/** `GET /api/chain/spec`: the chain's consensus parameters. */
+export interface ChainSpec {
+  /** Milliseconds the difficulty adjustment aims for between blocks. */
+  readonly targetBlockTime: bigint;
+  readonly initialReward: bigint;
+  readonly halvingInterval: bigint;
+  readonly maxBlockSize: number;
+  readonly maxNumberOfTransactionsPerBlock: bigint;
+  readonly premine: bigint;
+  readonly halfLife: bigint;
+}
+
+export function parseChainSpec(value: unknown): ChainSpec {
+  const body = record(value, "chain spec");
+  return {
+    targetBlockTime: decimal(body.targetBlockTime, "chainSpec.targetBlockTime"),
+    initialReward: decimal(body.initialReward, "chainSpec.initialReward"),
+    halvingInterval: decimal(body.halvingInterval, "chainSpec.halvingInterval"),
+    maxBlockSize: integer(body.maxBlockSize, "chainSpec.maxBlockSize"),
+    maxNumberOfTransactionsPerBlock: decimal(
+      body.maxNumberOfTransactionsPerBlock,
+      "chainSpec.maxNumberOfTransactionsPerBlock",
+    ),
+    premine: decimal(body.premine, "chainSpec.premine"),
+    halfLife: decimal(body.halfLife, "chainSpec.halfLife"),
+  };
+}
