@@ -218,6 +218,24 @@ export function encodeSignedTransaction(
   return { bytes, cid: cidV1DagCbor(bytes) };
 }
 
+/**
+ * The bytes a node's pool counts for `body` once each of its signers has
+ * signed it: the body plus the envelope, as `encodeTransactionBody` and
+ * `encodeSignedTransaction` encode them. Keys and signatures have fixed
+ * lengths, so this is exact before signing; a fee priced from a node's fee
+ * rate (`feeToOutbid`) needs it.
+ */
+export function signedTransactionSize(body: TransactionBody): number {
+  const encoded = encodeTransactionBody(body);
+  const signatures = Object.fromEntries(
+    body.signers.map((_, index) => [
+      "ed01" + index.toString(16).padStart(64, "0"),
+      "0".repeat(128),
+    ]),
+  );
+  return encoded.bytes.length + encodeSignedTransaction(signatures, encoded.cid).bytes.length;
+}
+
 /** The CID of a signed transaction (see `encodeSignedTransaction`). */
 export function signedTransactionCID(
   signatures: Readonly<Record<string, string>>,
