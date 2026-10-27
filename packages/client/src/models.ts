@@ -361,13 +361,17 @@ export function transactionWeight(size: number, growth: number, weight?: FeeWeig
   let result = Math.max(1, size + weight.transactionAllowance);
   if (weight.blockRoom <= 0) return result;
   if (growth > 0) {
-    if (weight.growthRoom <= 0 || growth >= weight.growthRoom) result = Math.max(result, weight.blockRoom);
+    if (weight.growthRoom <= 0 || growth >= weight.growthRoom)
+      result = Math.max(result, weight.blockRoom);
     else {
-      const share = (BigInt(growth) * BigInt(weight.blockRoom) + BigInt(weight.growthRoom) - 1n) / BigInt(weight.growthRoom);
+      const share =
+        (BigInt(growth) * BigInt(weight.blockRoom) + BigInt(weight.growthRoom) - 1n) /
+        BigInt(weight.growthRoom);
       result = Math.max(result, Number(share));
     }
   }
-  if (weight.maxTransactions > 0) result = Math.max(result, Math.floor(weight.blockRoom / weight.maxTransactions));
+  if (weight.maxTransactions > 0)
+    result = Math.max(result, Math.floor(weight.blockRoom / weight.maxTransactions));
   return result;
 }
 
@@ -380,7 +384,10 @@ export function parseFeeEstimates(value: unknown): FeeEstimates {
         blockRoom: integer(weight.blockRoom, "fees.weight.blockRoom"),
         growthRoom: integer(weight.growthRoom, "fees.weight.growthRoom"),
         maxTransactions: integer(weight.maxTransactions, "fees.weight.maxTransactions"),
-        transactionAllowance: integer(weight.transactionAllowance, "fees.weight.transactionAllowance"),
+        transactionAllowance: integer(
+          weight.transactionAllowance,
+          "fees.weight.transactionAllowance",
+        ),
       },
     }),
     minRelayFee: decimal(body.minRelayFee, "fees.minRelayFee"),
@@ -388,7 +395,8 @@ export function parseFeeEstimates(value: unknown): FeeEstimates {
       const block = record(entry, name);
       const lowestFeeBytes = integer(block.lowestFeeBytes, `${name}.lowestFeeBytes`);
       if (lowestFeeBytes <= 0) throw new TypeError(`${name}.lowestFeeBytes must be positive`);
-      const lowestFeeWeight = optionalInteger(block.lowestFeeWeight, `${name}.lowestFeeWeight`) ?? lowestFeeBytes;
+      const lowestFeeWeight =
+        optionalInteger(block.lowestFeeWeight, `${name}.lowestFeeWeight`) ?? lowestFeeBytes;
       if (lowestFeeWeight <= 0) throw new TypeError(`${name}.lowestFeeWeight must be positive`);
       const full = optionalBoolean(block.full, `${name}.full`);
       if (full === undefined) throw new TypeError(`${name}.full must be a boolean`);

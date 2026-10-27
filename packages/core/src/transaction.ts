@@ -254,7 +254,8 @@ export function stateGrowthCeiling(body: TransactionBody): number {
   }
   for (const deposit of body.depositActions) growth += 32 + length(deposit.demander);
   for (const receipt of body.receiptActions) {
-    growth += length(receipt.withdrawer) + length(receipt.demander) + length(receipt.directory) + 24;
+    growth +=
+      length(receipt.withdrawer) + length(receipt.demander) + length(receipt.directory) + 24;
   }
   for (const withdrawal of body.withdrawalActions) {
     growth += length(withdrawal.withdrawer) + length(withdrawal.demander) + 32;
