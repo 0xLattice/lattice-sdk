@@ -142,13 +142,15 @@ test("fees: weight is the most of a block a transaction takes of any limit", asy
   // As the node weighs it.
   const room = 998_208;
   assert.equal(transactionWeight(300, 300), 300, "an older node: size");
-  assert.equal(transactionWeight(300, 300, { blockRoom: room, growthRoom: room, maxTransactions: room }), 300);
-  assert.equal(transactionWeight(300, 100, { blockRoom: room, growthRoom: room / 8, maxTransactions: room }), 800);
-  assert.equal(transactionWeight(300, 0, { blockRoom: room, growthRoom: room, maxTransactions: 10 }), Math.floor(room / 10));
+  const terms = { blockRoom: room, growthRoom: room, maxTransactions: room, transactionAllowance: 256 };
+  assert.equal(transactionWeight(300, 300, terms), 556, "its bytes and its place in the block");
+  assert.equal(transactionWeight(300, 100, { ...terms, growthRoom: room / 8 }), 800);
+  assert.equal(transactionWeight(300, room, { ...terms, growthRoom: room / 8 }), room, "past the growth room: the whole block");
+  assert.equal(transactionWeight(300, 0, { ...terms, maxTransactions: 10 }), Math.floor(room / 10));
   const fees = parseFeeEstimates({
     minRelayFee: "1",
     blocks: [{ transactionCount: 1, bytes: 300, lowestFee: "50", lowestFeeBytes: 300, lowestFeeWeight: 600, full: true }],
-    weight: { blockRoom: room, growthRoom: room, maxTransactions: 5000 },
+    weight: { blockRoom: room, growthRoom: room, maxTransactions: 5000, transactionAllowance: 256 },
   });
   assert.equal(fees.blocks[0]?.lowestFeeWeight, 600);
   assert.equal(feeToOutbid(fees.blocks[0]!, 600), 51n, "a rate over weight");

@@ -343,22 +343,29 @@ export interface FeeWeight {
   readonly blockRoom: number;
   readonly growthRoom: number;
   readonly maxTransactions: number;
+  /** What a block charges each transaction beyond its bytes. */
+  readonly transactionAllowance: number;
 }
 
 /**
  * What a node's fee rate is over for a transaction of `size` bytes adding at
  * most `growth` state (`stateGrowthCeiling`): the most of a block it takes of
- * any limit, in the block's bytes. Its size; its growth times
- * `blockRoom / growthRoom`, rounded up; and `blockRoom / maxTransactions`.
- * Its size where `weight` is absent (an older node).
+ * any limit, in the block's bytes, as the node's `FeeWeight` weighs it. Its
+ * size plus `transactionAllowance`; its growth times `blockRoom / growthRoom`,
+ * rounded up (past `growthRoom`, the whole block); and
+ * `blockRoom / maxTransactions`. Its size where `weight` is absent (an older
+ * node, which ranks per byte).
  */
 export function transactionWeight(size: number, growth: number, weight?: FeeWeight): number {
-  let result = Math.max(1, size);
-  if (!weight || weight.blockRoom <= 0) return result;
-  if (growth > 0 && weight.growthRoom > 0) {
-    const room = BigInt(weight.blockRoom);
-    const share = (BigInt(growth) * room + BigInt(weight.growthRoom) - 1n) / BigInt(weight.growthRoom);
-    result = Math.max(result, Number(share < room ? share : room));
+  if (!weight) return Math.max(1, size);
+  let result = Math.max(1, size + weight.transactionAllowance);
+  if (weight.blockRoom <= 0) return result;
+  if (growth > 0) {
+    if (weight.growthRoom <= 0 || growth >= weight.growthRoom) result = Math.max(result, weight.blockRoom);
+    else {
+      const share = (BigInt(growth) * BigInt(weight.blockRoom) + BigInt(weight.growthRoom) - 1n) / BigInt(weight.growthRoom);
+      result = Math.max(result, Number(share));
+    }
   }
   if (weight.maxTransactions > 0) result = Math.max(result, Math.floor(weight.blockRoom / weight.maxTransactions));
   return result;
@@ -373,6 +380,7 @@ export function parseFeeEstimates(value: unknown): FeeEstimates {
         blockRoom: integer(weight.blockRoom, "fees.weight.blockRoom"),
         growthRoom: integer(weight.growthRoom, "fees.weight.growthRoom"),
         maxTransactions: integer(weight.maxTransactions, "fees.weight.maxTransactions"),
+        transactionAllowance: integer(weight.transactionAllowance, "fees.weight.transactionAllowance"),
       },
     }),
     minRelayFee: decimal(body.minRelayFee, "fees.minRelayFee"),
