@@ -236,6 +236,42 @@ export function signedTransactionSize(body: TransactionBody): number {
   return encoded.bytes.length + encodeSignedTransaction(signatures, encoded.cid).bytes.length;
 }
 
+/**
+ * The most state `body` can add to a block, from the body alone, as Lattice's
+ * `TransactionBody.stateGrowthCeiling` counts it (spec §6.6): its actions'
+ * deltas, `len(owner) + 8` for each owner it nets a credit to and
+ * `len("_nonce_" + signer) + 8` for its first signer, each taken as new.
+ * Removals are never credited, so it may be negative only through deleted
+ * action keys. A node weighs a transaction by it (`transactionWeight`).
+ */
+export function stateGrowthCeiling(body: TransactionBody): number {
+  const length = (value: string) => utf8(value).length;
+  let growth = 0;
+  for (const action of body.actions) {
+    if (action.oldValue === undefined) growth += length(action.key) + length(action.newValue ?? "");
+    else if (action.newValue === undefined) growth -= length(action.key) + length(action.oldValue);
+    else growth += length(action.newValue) - length(action.oldValue);
+  }
+  for (const deposit of body.depositActions) growth += 32 + length(deposit.demander);
+  for (const receipt of body.receiptActions) {
+    growth += length(receipt.withdrawer) + length(receipt.demander) + length(receipt.directory) + 24;
+  }
+  for (const withdrawal of body.withdrawalActions) {
+    growth += length(withdrawal.withdrawer) + length(withdrawal.demander) + 32;
+  }
+  const net = new Map<string, bigint>();
+  const add = (owner: string, delta: bigint) => net.set(owner, (net.get(owner) ?? 0n) + delta);
+  for (const action of body.accountActions) add(action.owner, action.delta);
+  for (const receipt of body.receiptActions) {
+    add(receipt.withdrawer, -receipt.amountDemanded);
+    add(receipt.demander, receipt.amountDemanded);
+  }
+  for (const [owner, delta] of net) if (delta > 0n) growth += length(owner) + 8;
+  const signer = body.signers[0];
+  if (signer !== undefined) growth += length("_nonce_" + signer) + 8;
+  return growth;
+}
+
 /** The CID of a signed transaction (see `encodeSignedTransaction`). */
 export function signedTransactionCID(
   signatures: Readonly<Record<string, string>>,
