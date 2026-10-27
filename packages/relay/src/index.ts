@@ -30,7 +30,11 @@ export interface HTTPSubmitterOptions {
 export const SUBMISSION_REFUSALS = [
   "belowMinRelayFee",
   "feeTooLow",
+  // Nodes before the funded-only pool; newer ones say feeTooLow.
   "conflictingNonce",
+  "nonceAhead",
+  "unavailable",
+  "insufficientFunds",
   "invalidState",
   "tooLarge",
   "full",

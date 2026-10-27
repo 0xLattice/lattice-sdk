@@ -101,6 +101,9 @@ test("named node refusals surface as typed submission errors", async () => {
   for (const [status, name] of [
     [400, "belowMinRelayFee"],
     [400, "feeTooLow"],
+    [400, "nonceAhead"],
+    [400, "unavailable"],
+    [400, "insufficientFunds"],
     [404, "unknownChain"],
     [429, "full"],
   ] as const) {
