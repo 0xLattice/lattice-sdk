@@ -55,6 +55,7 @@ test("fees and chain spec read the node's routes with exact integers", async () 
       bytes: 900000,
       lowestFee: 18_446_744_073_709_551_615n,
       lowestFeeBytes: 300,
+      lowestFeeWeight: 300,
       full: true,
     },
   ]);
@@ -94,12 +95,13 @@ test("feeToOutbid pays strictly more than the block's lowest rate", () => {
     bytes: 600,
     lowestFee: 10n,
     lowestFeeBytes: 300,
+    lowestFeeWeight: 300,
     full: true,
   };
   assert.equal(feeToOutbid(block, 300), 11n, "same size: one more");
   assert.equal(feeToOutbid(block, 450), 16n, "15 is the same rate; 16 is above it");
   assert.equal(feeToOutbid({ ...block, lowestFee: 0n }, 300), 1n, "above a zero-fee block");
-  assert.throws(() => feeToOutbid(block, 0), /size must be a positive integer/);
+  assert.throws(() => feeToOutbid(block, 0), /weight must be a positive integer/);
 });
 
 test("signedTransactionSize is the size of the signed transaction, before signing", () => {
@@ -124,4 +126,81 @@ test("signedTransactionSize is the size of the signed transaction, before signin
         .length;
     assert.equal(signedTransactionSize(body), actual);
   }
+});
+
+test("fees: weight is the most of a block a transaction takes of any limit", async () => {
+  const { transactionWeight, parseFeeEstimates } = await import("@adalin/lattice-client");
+  const { stateGrowthCeiling } = await import("@adalin/lattice-core");
+  const body = (
+    accountActions: { owner: string; delta: bigint }[],
+    actions: { key: string; oldValue?: string; newValue?: string }[] = [],
+    signer = "ab",
+  ) => ({
+    accountActions,
+    actions,
+    depositActions: [],
+    receiptActions: [],
+    withdrawalActions: [],
+    signers: [signer],
+    nonce: 0n,
+    chainPath: ["Nexus"],
+  });
+  // As Lattice counts it: a write (+2), "ab" credited (2 + 8), "_nonce_ab" (9 + 8).
+  assert.equal(
+    stateGrowthCeiling(body([{ owner: "ab", delta: 5n }], [{ key: "k", newValue: "v" }])),
+    2 + 10 + 17,
+  );
+  // "ab" pays new "cdef": the payee (4 + 8) and the nonce, never a removal.
+  assert.equal(
+    stateGrowthCeiling(
+      body([
+        { owner: "ab", delta: -1n },
+        { owner: "cdef", delta: 1n },
+      ]),
+    ),
+    12 + 17,
+  );
+  assert.equal(stateGrowthCeiling(body([], [{ key: "k", oldValue: "v" }])), -2 + 17);
+  // As the node weighs it.
+  const room = 998_208;
+  assert.equal(transactionWeight(300, 300), 300, "an older node: size");
+  const terms = {
+    blockRoom: room,
+    growthRoom: room,
+    maxTransactions: room,
+    transactionAllowance: 256,
+  };
+  assert.equal(transactionWeight(300, 300, terms), 556, "its bytes and its place in the block");
+  assert.equal(transactionWeight(300, 100, { ...terms, growthRoom: room / 8 }), 800);
+  assert.equal(
+    transactionWeight(300, room, { ...terms, growthRoom: room / 8 }),
+    room,
+    "past the growth room: the whole block",
+  );
+  assert.equal(transactionWeight(300, 0, { ...terms, maxTransactions: 10 }), Math.floor(room / 10));
+  const fees = parseFeeEstimates({
+    minRelayFee: "1",
+    blocks: [
+      {
+        transactionCount: 1,
+        bytes: 300,
+        lowestFee: "50",
+        lowestFeeBytes: 300,
+        lowestFeeWeight: 600,
+        full: true,
+      },
+    ],
+    weight: { blockRoom: room, growthRoom: room, maxTransactions: 5000, transactionAllowance: 256 },
+  });
+  assert.equal(fees.blocks[0]?.lowestFeeWeight, 600);
+  assert.equal(feeToOutbid(fees.blocks[0]!, 600), 51n, "a rate over weight");
+  assert.equal(
+    parseFeeEstimates({
+      minRelayFee: "1",
+      blocks: [
+        { transactionCount: 1, bytes: 300, lowestFee: "50", lowestFeeBytes: 300, full: true },
+      ],
+    }).blocks[0]?.lowestFeeWeight,
+    300,
+  );
 });

@@ -313,11 +313,13 @@ export interface ProjectedBlock {
   readonly transactionCount: number;
   readonly bytes: number;
   /**
-   * The block's lowest rate, `lowestFee` over `lowestFeeBytes`: a transaction
-   * paying a higher rate would have been taken before it.
+   * The block's lowest rate, `lowestFee` over `lowestFeeWeight`: a
+   * transaction paying a higher rate would have been taken before it.
    */
   readonly lowestFee: bigint;
   readonly lowestFeeBytes: number;
+  /** Its weight (`transactionWeight`); `lowestFeeBytes` from an older node. */
+  readonly lowestFeeWeight: number;
   /** Whether ready transactions were left for a later block. */
   readonly full: boolean;
 }
@@ -332,16 +334,70 @@ export interface FeeEstimates {
   /** This node's relay floor (policy, never consensus), as in chain info. */
   readonly minRelayFee: bigint;
   readonly blocks: readonly ProjectedBlock[];
+  /** What a transaction's weight is measured against; absent from older nodes. */
+  readonly weight?: FeeWeight;
+}
+
+/** A chain's block limits as `transactionWeight` measures against them, in bytes. */
+export interface FeeWeight {
+  readonly blockRoom: number;
+  readonly growthRoom: number;
+  readonly maxTransactions: number;
+  /** What a block charges each transaction beyond its bytes. */
+  readonly transactionAllowance: number;
+}
+
+/**
+ * What a node's fee rate is over for a transaction of `size` bytes adding at
+ * most `growth` state (`stateGrowthCeiling`): the most of a block it takes of
+ * any limit, in the block's bytes, as the node's `FeeWeight` weighs it. Its
+ * size plus `transactionAllowance`; its growth times `blockRoom / growthRoom`,
+ * rounded up (past `growthRoom`, the whole block); and
+ * `blockRoom / maxTransactions`. Its size where `weight` is absent (an older
+ * node, which ranks per byte).
+ */
+export function transactionWeight(size: number, growth: number, weight?: FeeWeight): number {
+  if (!weight) return Math.max(1, size);
+  let result = Math.max(1, size + weight.transactionAllowance);
+  if (weight.blockRoom <= 0) return result;
+  if (growth > 0) {
+    if (weight.growthRoom <= 0 || growth >= weight.growthRoom)
+      result = Math.max(result, weight.blockRoom);
+    else {
+      const share =
+        (BigInt(growth) * BigInt(weight.blockRoom) + BigInt(weight.growthRoom) - 1n) /
+        BigInt(weight.growthRoom);
+      result = Math.max(result, Number(share));
+    }
+  }
+  if (weight.maxTransactions > 0)
+    result = Math.max(result, Math.floor(weight.blockRoom / weight.maxTransactions));
+  return result;
 }
 
 export function parseFeeEstimates(value: unknown): FeeEstimates {
   const body = record(value, "fees");
+  const weight = body.weight === undefined ? undefined : record(body.weight, "fees.weight");
   return {
+    ...(weight && {
+      weight: {
+        blockRoom: integer(weight.blockRoom, "fees.weight.blockRoom"),
+        growthRoom: integer(weight.growthRoom, "fees.weight.growthRoom"),
+        maxTransactions: integer(weight.maxTransactions, "fees.weight.maxTransactions"),
+        transactionAllowance: integer(
+          weight.transactionAllowance,
+          "fees.weight.transactionAllowance",
+        ),
+      },
+    }),
     minRelayFee: decimal(body.minRelayFee, "fees.minRelayFee"),
     blocks: array(body.blocks, "fees.blocks", (entry, name) => {
       const block = record(entry, name);
       const lowestFeeBytes = integer(block.lowestFeeBytes, `${name}.lowestFeeBytes`);
       if (lowestFeeBytes <= 0) throw new TypeError(`${name}.lowestFeeBytes must be positive`);
+      const lowestFeeWeight =
+        optionalInteger(block.lowestFeeWeight, `${name}.lowestFeeWeight`) ?? lowestFeeBytes;
+      if (lowestFeeWeight <= 0) throw new TypeError(`${name}.lowestFeeWeight must be positive`);
       const full = optionalBoolean(block.full, `${name}.full`);
       if (full === undefined) throw new TypeError(`${name}.full must be a boolean`);
       return {
@@ -349,6 +405,7 @@ export function parseFeeEstimates(value: unknown): FeeEstimates {
         bytes: integer(block.bytes, `${name}.bytes`),
         lowestFee: decimal(block.lowestFee, `${name}.lowestFee`),
         lowestFeeBytes,
+        lowestFeeWeight,
         full,
       };
     }),
@@ -356,15 +413,16 @@ export function parseFeeEstimates(value: unknown): FeeEstimates {
 }
 
 /**
- * The smallest fee for a transaction of `size` bytes to rank ahead of
- * `block`'s lowest-rate package, and so be taken into that block or an
- * earlier one: a rate strictly above `lowestFee / lowestFeeBytes` (equal
- * rates break by CID, which a sender does not choose).
+ * The smallest fee for a transaction of `weight` (`transactionWeight`; its
+ * size where the node serves none) to rank ahead of `block`'s lowest-rate
+ * transaction, and so be taken into that block or an earlier one: a rate
+ * strictly above `lowestFee / lowestFeeWeight` (equal rates break by CID,
+ * which a sender does not choose).
  */
-export function feeToOutbid(block: ProjectedBlock, size: number): bigint {
-  if (!Number.isSafeInteger(size) || size <= 0)
-    throw new RangeError("size must be a positive integer");
-  return (block.lowestFee * BigInt(size)) / BigInt(block.lowestFeeBytes) + 1n;
+export function feeToOutbid(block: ProjectedBlock, weight: number): bigint {
+  if (!Number.isSafeInteger(weight) || weight <= 0)
+    throw new RangeError("weight must be a positive integer");
+  return (block.lowestFee * BigInt(weight)) / BigInt(block.lowestFeeWeight) + 1n;
 }
 
 /** `GET /api/chain/spec`: the chain's consensus parameters. */
