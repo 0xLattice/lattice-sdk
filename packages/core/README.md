@@ -15,7 +15,7 @@ import { buildTransfer, signTransactionBody } from "@adalin/lattice-core";
 ```
 
 This package implements protocol-facing values. Applications should normally
-start with [`@adalin/lattice-sdk`](https://github.com/adalinxx/lattice-sdk),
+start with [`@adalin/lattice-sdk`](https://github.com/0xLattice/lattice-sdk),
 which also composes node reads and verified content retrieval.
 
 MIT

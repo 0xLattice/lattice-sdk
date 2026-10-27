@@ -5,7 +5,7 @@
   "type": "module",
   "description": "TypeScript SDK for the Lattice network",
   "license": "MIT",
-  "repository": "github:adalinxx/lattice-sdk",
+  "repository": "github:0xLattice/lattice-sdk",
   "engines": {
     "node": ">=22"
   },

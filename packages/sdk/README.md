@@ -19,7 +19,7 @@ const client = new LatticeClient(
 );
 ```
 
-See the [repository documentation](https://github.com/adalinxx/lattice-sdk)
+See the [repository documentation](https://github.com/0xLattice/lattice-sdk)
 for verified reads, content gateways, signing, and submission.
 
 MIT

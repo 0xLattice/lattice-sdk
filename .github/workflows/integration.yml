@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/checkout@v5
         with:
-          repository: adalinxx/lattice-node
+          repository: 0xLattice/lattice-node
           path: .integration/lattice-node
       - uses: swift-actions/setup-swift@v2
         with:
