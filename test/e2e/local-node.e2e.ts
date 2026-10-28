@@ -1,4 +1,4 @@
-// End-to-end against a local lattice-node: build adalinxx/lattice-node main and
+// End-to-end against a local lattice-node: build 0xLattice/lattice-node main and
 // run `LATTICE_NODE_BIN=<.build/debug> npm run test:e2e`. The node runs isolated
 // (--no-default-peers, no --peer) on throwaway storage, forking the Nexus
 // genesis privately; nothing is

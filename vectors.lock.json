@@ -1,5 +1,5 @@
 {
-  "repository": "adalinxx/Lattice",
+  "repository": "0xLattice/Lattice",
   "commit": "73f21673b56577ad30a29c39ed1573609ffc4f70",
   "version": 1,
   "files": ["addresses.json", "encoding.json", "proofs.json", "signing.json"],

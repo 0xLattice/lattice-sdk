@@ -142,7 +142,7 @@ known header chain) for sync progress.
 ## Conformance
 
 `vectors.lock.json` pins the authoritative vectors from
-[`adalinxx/Lattice`](https://github.com/adalinxx/Lattice/tree/main/Vectors).
+[`0xLattice/Lattice`](https://github.com/0xLattice/Lattice/tree/main/Vectors).
 Tests fetch that exact commit and reproduce every address, encoding, CID, and
 signature vector. The SDK does not maintain an independent copy of consensus
 fixtures.

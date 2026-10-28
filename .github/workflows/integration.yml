@@ -17,13 +17,13 @@ concurrency:
 
 jobs:
   local-node:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/checkout@v5
         with:
-          repository: adalinxx/lattice-node
+          repository: 0xLattice/lattice-node
           path: .integration/lattice-node
       - uses: swift-actions/setup-swift@v2
         with:
