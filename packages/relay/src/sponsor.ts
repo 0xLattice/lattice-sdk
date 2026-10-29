@@ -236,7 +236,12 @@ export class SponsorClient {
     };
     const sponsor = transaction?.body?.signers?.[1];
     const signer = draft.signers[0];
-    if (typeof sponsor !== "string" || signer === undefined || draft.signers.length !== 1) {
+    if (
+      typeof sponsor !== "string" ||
+      signer === undefined ||
+      draft.signers.length !== 1 ||
+      sponsor === signer
+    ) {
       throw new SponsorError(200, "not a sponsored transaction");
     }
     const body: TransactionBody = {
@@ -252,14 +257,18 @@ export class SponsorClient {
     if (!sameJSON(expected, transaction.body)) {
       throw new SponsorError(200, "the sponsored body is not the draft plus the fee");
     }
-    const signatures: Record<string, string> = {};
-    for (const [key, value] of Object.entries(transaction.signatures ?? {})) {
-      if (typeof value !== "string" || addressFromMultikey(key) !== sponsor) {
-        throw new SponsorError(200, "a signature is not the sponsor's");
-      }
-      signatures[key] = value;
+    // Exactly the sponsor's own signature.
+    const entries = Object.entries(transaction.signatures ?? {});
+    const [key, value] = entries[0] ?? [];
+    if (
+      entries.length !== 1 ||
+      key === undefined ||
+      typeof value !== "string" ||
+      addressFromMultikey(key) !== sponsor
+    ) {
+      throw new SponsorError(200, "not the sponsor's signature");
     }
-    return { body, signatures, fee, pay };
+    return { body, signatures: { [key]: value }, fee, pay };
   }
 
   /** Hold an upload of `volumes` (root included) under `root`, to be paid for in work. */
@@ -320,14 +329,19 @@ export async function* grind(
   const view = new DataView(nonceBuffer.buffer);
   signal?.throwIfAborted();
   const end = work.startNonce + work.count;
-  for (let nonce = work.startNonce; nonce < end; nonce += 1n) {
-    if ((nonce & 0x3fffn) === 0n) {
+  for (let nonce = work.startNonce, step = 0; nonce < end; nonce += 1n, step += 1) {
+    if (step % 0x4000 === 0) {
       await new Promise((resolve) => setTimeout(resolve, 0));
       signal?.throwIfAborted();
       if (Date.now() >= work.expiresAt) return;
     }
     view.setBigUint64(0, nonce);
-    if (atMost(midstate.clone().update(nonceBuffer).digest(), target)) yield nonce;
+    if (atMost(midstate.clone().update(nonceBuffer).digest(), target)) {
+      yield nonce;
+      // The consumer may have stopped the search while it held the share.
+      signal?.throwIfAborted();
+      if (Date.now() >= work.expiresAt) return;
+    }
   }
 }
 

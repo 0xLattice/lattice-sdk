@@ -72,8 +72,10 @@ test("grind stops when aborted or expired", async () => {
   await assert.rejects(async () => {
     for await (const _ of grind(work, controller.signal)) assert.fail("no hash is zero");
   }, /stop/);
+  // An unaligned range is checked from its first nonce.
   const expired: bigint[] = [];
-  for await (const nonce of grind({ ...work, expiresAt: Date.now() - 1 })) expired.push(nonce);
+  for await (const nonce of grind({ ...work, startNonce: 3n, expiresAt: Date.now() - 1 }))
+    expired.push(nonce);
   assert.deepEqual(expired, []);
 });
 
@@ -193,6 +195,22 @@ test("a sponsored body is checked to be the draft plus the sponsor's fee", async
   // A body debiting the sponsor anything but fee and pay is never returned to sign.
   const greedy = fakeSponsor(() => sponsored("-8"));
   await assert.rejects(greedy.client.sponsorTransaction("token", draft, 2n), SponsorError);
+  // The client as its own "sponsor", paying a fee it never chose, is refused.
+  const self = sponsored("-7");
+  self.transaction.body.signers = [user.address, user.address];
+  self.transaction.body.accountActions[1]!.owner = user.address;
+  self.transaction.signatures = {};
+  await assert.rejects(
+    fakeSponsor(() => self).client.sponsorTransaction("token", draft, 2n),
+    SponsorError,
+  );
+  // So is an answer without the sponsor's signature.
+  const unsigned = sponsored("-7");
+  unsigned.transaction.signatures = {};
+  await assert.rejects(
+    fakeSponsor(() => unsigned).client.sponsorTransaction("token", draft, 2n),
+    SponsorError,
+  );
 });
 
 test("a refusal carries the sponsor's status and reason", async () => {
