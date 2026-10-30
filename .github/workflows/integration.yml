@@ -35,13 +35,20 @@ jobs:
       - run: npm ci
       - name: Build the real node and mining coordinator
         run: swift build --package-path .integration/lattice-node -c debug
-      - name: Exercise reads, private/public relay policy, mining, and inclusion
+      # lattice-sponsor from its pinned image, run beside the node as a binary.
+      - name: The pinned lattice-sponsor
+        run: |
+          docker create --name sponsor ghcr.io/0xlattice/lattice-sponsor:sha-24d8c4d
+          docker cp sponsor:/usr/local/bin/lattice-sponsor "$RUNNER_TEMP/lattice-sponsor"
+          docker rm sponsor
+      - name: Exercise reads, relay policy, mining, inclusion, and paying a sponsor in work
         env:
           LATTICE_NODE_BIN: ${{ github.workspace }}/.integration/lattice-node/.build/debug
+          LATTICE_SPONSOR_BIN: ${{ runner.temp }}/lattice-sponsor
         run: npm run test:e2e
       - if: failure()
         uses: actions/upload-artifact@v5
         with:
           name: local-node-e2e-logs
-          path: /tmp/lattice-sdk-e2e-*/node.log
+          path: /tmp/lattice-sdk-e2e-*/*.log
           if-no-files-found: ignore
