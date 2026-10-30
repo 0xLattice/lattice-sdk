@@ -261,7 +261,10 @@ after(async () => {
     child.kill("SIGTERM");
     await exited;
   }
-  if (directory !== undefined) rmSync(directory, { recursive: true, force: true });
+  // On CI the logs stay for the failure upload; the runner is thrown away.
+  if (directory !== undefined && process.env.CI === undefined) {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("a coinless key stores a file and posts it, paying in work; another node reads both", async () => {

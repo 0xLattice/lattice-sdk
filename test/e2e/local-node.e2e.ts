@@ -127,7 +127,10 @@ after(async () => {
     node.kill("SIGTERM");
     await exited;
   }
-  if (directory !== undefined) rmSync(directory, { recursive: true, force: true });
+  // On CI the logs stay for the failure upload; the runner is thrown away.
+  if (directory !== undefined && process.env.CI === undefined) {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("local node: fund, submit via the operator and public relays, observe inclusion", async () => {
