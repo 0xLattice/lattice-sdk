@@ -32,6 +32,16 @@ export interface ChainNodesOptions {
   readonly random?: () => number;
 }
 
+/** A chain's list, as it is being made and once it is made. */
+interface ListEntry {
+  /** The start nodes that serve the chain, known before the walk ends; empty if none or the checks failed. */
+  readonly own: Promise<ChainNode[]>;
+  list: Promise<ChainNode[]>;
+  /** The list, once made. */
+  whole?: ChainNode[];
+  until: number;
+}
+
 /**
  * The nodes that serve a chain: the start nodes (the ones the reader chose,
  * or an app's defaults) that serve the chain, then the hosts the chain's
@@ -42,7 +52,9 @@ export interface ChainNodesOptions {
  *
  * Every level is read the same way, round robin: each {@link read} of a chain
  * begins at the next node in its list and goes on through the rest until one
- * answers, so reads spread evenly over the nodes that serve it. Each walk
+ * answers, so reads spread evenly over the nodes that serve it. A read does
+ * not wait for the walk when a start node serves the chain: it begins on the
+ * start nodes that do, and goes on to the found hosts only if they all fail. Each walk
  * down begins at the next start node the same way. Turns begin at a random
  * node, so many readers with the same start nodes spread too.
  *
@@ -62,7 +74,7 @@ export class ChainNodes {
   readonly #resolver: Omit<EndpointResolverOptions, "fetch">;
   readonly #now: () => number;
   readonly #random: () => number;
-  readonly #lists = new Map<string, { list: Promise<ChainNode[]>; until: number }>();
+  readonly #lists = new Map<string, ListEntry>();
   /** Per chain, the next turn of its reads and of its walks down. */
   readonly #turns = new Map<string, { read: number; walk: number }>();
 
@@ -91,38 +103,65 @@ export class ChainNodes {
 
   /** The nodes serving `chainPath`: start nodes first, then found hosts, in declared order. */
   list(chainPath: readonly string[]): Promise<ChainNode[]> {
+    return this.#entry(chainPath).list;
+  }
+
+  #entry(chainPath: readonly string[]): ListEntry {
     const key = JSON.stringify(chainPath);
     const kept = this.#lists.get(key);
-    if (kept !== undefined && this.#now() < kept.until) return kept.list;
-    // Kept from when the list is made, not asked for.
-    const entry = { list: this.#list([...chainPath]), until: Infinity };
+    if (kept !== undefined && this.#now() < kept.until) return kept;
+    let own!: (nodes: ChainNode[]) => void;
+    const entry: ListEntry = {
+      own: new Promise((resolve) => (own = resolve)),
+      list: Promise.resolve([]),
+      // Kept from when the list is made, not asked for.
+      until: Infinity,
+    };
+    entry.list = this.#list([...chainPath], own);
     this.#lists.set(key, entry);
     entry.list.then(
-      () => (entry.until = this.#now() + this.#ttl),
+      (nodes) => {
+        entry.whole = nodes;
+        entry.until = this.#now() + this.#ttl;
+      },
       () => {
+        own([]);
         if (this.#lists.get(key) === entry) this.#lists.delete(key);
       },
     );
-    return entry.list;
+    return entry;
   }
 
   /**
    * `read` on the nodes serving `chainPath`, beginning at the next node in
    * turn and going round the list until one answers; else the last failure.
+   * While the walk is out, the start nodes that serve the chain are the list,
+   * and the found hosts are waited for only once they have all failed.
    */
   async read<T>(chainPath: readonly string[], read: (node: ChainNode) => Promise<T>): Promise<T> {
-    const nodes = await this.list(chainPath);
-    if (nodes.length === 0) throw new ChainOfflineError(chainPath);
+    const entry = this.#entry(chainPath);
     const turn = this.#turn(JSON.stringify(chainPath), "read");
+    let nodes = entry.whole ?? (await entry.own);
+    if (nodes.length === 0) nodes = await entry.list;
+    if (nodes.length === 0) throw new ChainOfflineError(chainPath);
+    const tried = new Set<string>();
     let failure: unknown;
-    for (let step = 0; step < nodes.length; step += 1) {
-      try {
-        return await read(nodes[(turn + step) % nodes.length]!);
-      } catch (error) {
-        failure = error;
+    for (;;) {
+      for (let step = 0; step < nodes.length; step += 1) {
+        const node = nodes[(turn + step) % nodes.length]!;
+        if (tried.has(node.url)) continue;
+        tried.add(node.url);
+        try {
+          return await read(node);
+        } catch (error) {
+          failure = error;
+        }
       }
+      // Only the start nodes were tried: go on to the hosts the walk finds.
+      if (nodes === entry.whole) throw failure;
+      nodes = await entry.list.catch(() => nodes);
+      if (nodes.every(({ url }) => tried.has(url))) throw failure;
     }
-    throw failure;
   }
 
   /** Whether `startURL` answers for `chainPath`: false on 404, throws on any other failure. */
@@ -140,29 +179,31 @@ export class ChainNodes {
     }
   }
 
-  async #list(chainPath: string[]): Promise<ChainNode[]> {
+  /** The whole list; `own` hears the start nodes that serve the chain as soon as they are known. */
+  async #list(chainPath: string[], own: (nodes: ChainNode[]) => void): Promise<ChainNode[]> {
     // Asked together, each within its timeout, like the hosts of any level.
     const checks = await Promise.allSettled(
       this.startURLs.map((url) => this.#serves(url, chainPath)),
     );
     const failure = checks.find((check) => check.status === "rejected");
     if (checks.every((check) => check.status === "rejected")) throw failure!.reason;
-    const own = this.startURLs
+    const serving: ChainNode[] = this.startURLs
       .filter((_, index) => {
         const check = checks[index]!;
         return check.status === "fulfilled" && check.value;
       })
       .map((url) => ({ url, found: false }));
-    const ownURLs = new Set(own.map(({ url }) => url));
+    own(serving);
+    const ownURLs = new Set(serving.map(({ url }) => url));
     // When a start node serves the chain itself, failing to find others
     // costs only the fallbacks.
     const nodes = await this.#declared(
       chainPath,
       this.startURLs.filter((_, index) => checks[index]!.status === "fulfilled"),
     ).then(
-      (found) => [...own, ...found.filter(({ url }) => !ownURLs.has(url))],
+      (found) => [...serving, ...found.filter(({ url }) => !ownURLs.has(url))],
       (error: unknown) => {
-        if (own.length > 0) return own;
+        if (serving.length > 0) return serving;
         throw error;
       },
     );

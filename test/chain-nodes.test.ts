@@ -374,3 +374,66 @@ test("concurrent reads share one lookup", async () => {
   await Promise.all([nodes.list(["N", "x"]), nodes.list(["N", "x"])]);
   assert.equal(dialed.filter((key) => key.includes("endpoints")).length, 1);
 });
+
+/** `fetch` with the directory held until `release()`. */
+function heldDirectory(fetch: (input: string | URL) => Promise<Response>) {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  return {
+    release,
+    fetch: async (input: string | URL): Promise<Response> => {
+      if (new URL(input).pathname === "/api/chain/endpoints") {
+        await released;
+      }
+      return fetch(input);
+    },
+  };
+}
+
+test("a start node that serves the chain is read without waiting for the walk", async () => {
+  const held = heldDirectory(
+    network({ [START]: ["N", "N/x"], [host("a")]: ["N/x"] }, () => ({ "N/x": [host("a")] })),
+  );
+  const nodes = new ChainNodes(START, { fetch: held.fetch, random: () => 0 });
+  // The directory answers only after this read: it did not wait for it.
+  assert.equal(await nodes.read(["N", "x"], async ({ url }) => url), START);
+  held.release();
+  // Once the walk ends, reads take turns over the whole list.
+  assert.deepEqual(await nodes.list(["N", "x"]), [
+    { url: START, found: false },
+    { url: host("a"), found: true },
+  ]);
+  assert.equal(await nodes.read(["N", "x"], async ({ url }) => url), host("a"));
+});
+
+test("when every start node fails a read, the read waits for the walk and goes on", async () => {
+  const held = heldDirectory(
+    network({ [START]: ["N", "N/x"], [host("a")]: ["N/x"] }, () => ({ "N/x": [host("a")] })),
+  );
+  const nodes = new ChainNodes(START, { fetch: held.fetch, random: () => 0 });
+  const tried: string[] = [];
+  const reading = nodes.read(["N", "x"], async ({ url }) => {
+    tried.push(url);
+    if (url === START) {
+      held.release();
+      throw new Error("start failed");
+    }
+    return url;
+  });
+  assert.equal(await reading, host("a"));
+  // The start node is not tried twice.
+  assert.deepEqual(tried, [START, host("a")]);
+});
+
+test("a read on the start nodes alone fails with their failure when the walk finds no more", async () => {
+  const nodes = new ChainNodes(START, {
+    fetch: network({ [START]: ["N", "N/x"] }, () => ({ "N/x": [START] })),
+    random: () => 0,
+  });
+  await assert.rejects(
+    nodes.read(["N", "x"], async () => {
+      throw new Error("start failed");
+    }),
+    /start failed/,
+  );
+});
