@@ -23,4 +23,32 @@ const volume = await volumes.get(rootCID);
 The HTTP transport uses Ivy's canonical binary complete-Volume archive. Native
 applications can implement `VolumeTransport` directly over Ivy or a DHT.
 
+## Keeping Volumes, and reading many at once
+
+A Volume never changes, so one verified Volume is the answer for its CID for
+good. Give `VolumeClient` a cache and it looks there first and keeps every
+Volume it verifies; a failing cache is only a miss.
+
+```ts
+import {
+  BatchingVolumeTransport,
+  HTTPVolumeTransport,
+  IndexedDBVolumeCache,
+  VolumeClient,
+} from "@adalin/lattice-volumes";
+
+const volumes = new VolumeClient(
+  // Reads made together (a walk reading a node's children) go as one request
+  // to `GET <base>?cids=…`; what the answer leaves out is read on its own.
+  new BatchingVolumeTransport(new HTTPVolumeTransport("https://content.example.org/volumes")),
+  undefined,
+  // Across visits in a browser; `MemoryVolumeCache` for one process.
+  { cache: new IndexedDBVolumeCache() },
+);
+```
+
+Both caches drop the least recently used Volumes past a byte bound
+(`maximumBytes`). A gateway without the many-Volumes route is read one Volume
+at a time from its first refusal on.
+
 MIT
