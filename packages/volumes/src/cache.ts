@@ -1,14 +1,17 @@
-import { VerifiedVolume, type VolumeEntry } from "./index.js";
+import type { SerializedVolume, VerifiedVolume, VolumeEntry } from "./index.js";
 
 /**
- * Volumes kept by root CID once verified. A Volume never changes, so a kept
- * one is the answer for its CID for good; {@link VolumeClient} puts only
- * Volumes it verified and takes them back as they were put. A cache that
- * fails answers nothing: every failure is a miss, never an error.
+ * Volumes kept by root CID. A Volume never changes, so one kept is the
+ * answer for its CID for good. {@link VolumeClient} puts only Volumes it
+ * verified, and verifies again what it takes back, under its own limits: a
+ * kept Volume is never trusted as kept. A cache that fails answers nothing:
+ * every failure is a miss, never an error.
  */
 export interface VolumeCache {
-  get(rootCID: string): Promise<VerifiedVolume | undefined>;
+  get(rootCID: string): Promise<SerializedVolume | undefined>;
   put(volume: VerifiedVolume): Promise<void>;
+  /** Drops what is kept for `rootCID`: it failed verification. */
+  delete?(rootCID: string): Promise<void>;
 }
 
 const volumeBytes = (entries: readonly VolumeEntry[]) =>
@@ -17,14 +20,14 @@ const volumeBytes = (entries: readonly VolumeEntry[]) =>
 /** Volumes kept in memory, the least recently used dropped past `maximumBytes`. */
 export class MemoryVolumeCache implements VolumeCache {
   readonly maximumBytes: number;
-  readonly #volumes = new Map<string, { volume: VerifiedVolume; bytes: number }>();
+  readonly #volumes = new Map<string, { volume: SerializedVolume; bytes: number }>();
   #bytes = 0;
 
   constructor({ maximumBytes = 32 * 1024 * 1024 }: { maximumBytes?: number } = {}) {
     this.maximumBytes = maximumBytes;
   }
 
-  async get(rootCID: string): Promise<VerifiedVolume | undefined> {
+  async get(rootCID: string): Promise<SerializedVolume | undefined> {
     const kept = this.#volumes.get(rootCID);
     if (kept === undefined) return undefined;
     // Most recently used last.
@@ -34,9 +37,10 @@ export class MemoryVolumeCache implements VolumeCache {
   }
 
   async put(volume: VerifiedVolume): Promise<void> {
-    const bytes = volumeBytes(volume.entries());
+    const entries = volume.entries();
+    const bytes = volumeBytes(entries);
     if (bytes > this.maximumBytes || this.#volumes.has(volume.rootCID)) return;
-    this.#volumes.set(volume.rootCID, { volume, bytes });
+    this.#volumes.set(volume.rootCID, { volume: { rootCID: volume.rootCID, entries }, bytes });
     this.#bytes += bytes;
     for (const [rootCID, kept] of this.#volumes) {
       if (this.#bytes <= this.maximumBytes) break;
@@ -44,28 +48,56 @@ export class MemoryVolumeCache implements VolumeCache {
       this.#bytes -= kept.bytes;
     }
   }
+
+  async delete(rootCID: string): Promise<void> {
+    const kept = this.#volumes.get(rootCID);
+    if (kept === undefined) return;
+    this.#volumes.delete(rootCID);
+    this.#bytes -= kept.bytes;
+  }
 }
 
-interface StoredVolume {
+// Three stores: the Volumes, a small record of when each was last used and
+// its size (so a hit writes a few bytes, not the Volume), and the total
+// size. The total changes only inside the transaction that changes what is
+// kept, so tabs sharing the database keep one count.
+const VOLUMES = "volumes";
+const USED = "used";
+const TOTAL = "total";
+
+interface Used {
   readonly rootCID: string;
-  readonly entries: readonly VolumeEntry[];
   readonly bytes: number;
-  used: number;
+  readonly used: number;
 }
 
-const STORE = "volumes";
+const isUsed = (value: unknown): value is Used =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as Used).rootCID === "string" &&
+  Number.isSafeInteger((value as Used).bytes) &&
+  (value as Used).bytes >= 0 &&
+  Number.isFinite((value as Used).used);
+
+const isVolume = (value: unknown, rootCID: string): value is SerializedVolume =>
+  typeof value === "object" &&
+  value !== null &&
+  (value as SerializedVolume).rootCID === rootCID &&
+  Array.isArray((value as SerializedVolume).entries) &&
+  (value as SerializedVolume).entries.every(
+    (entry) => typeof entry?.cid === "string" && entry.bytes instanceof Uint8Array,
+  );
 
 /**
  * Volumes kept in a browser's IndexedDB across visits, the least recently
- * used dropped past `maximumBytes`. Where IndexedDB is missing or refuses
- * (a private window, storage blocked or full), it keeps nothing.
+ * used dropped past `maximumBytes`. Where IndexedDB is missing, refuses or
+ * is held by another version (a private window, storage blocked or full), it
+ * keeps nothing.
  */
 export class IndexedDBVolumeCache implements VolumeCache {
   readonly maximumBytes: number;
   readonly #database: Promise<IDBDatabase | null>;
   readonly #now: () => number;
-  /** The bytes kept, read once at open and kept up to date after. */
-  #bytes = 0;
 
   constructor({
     name = "lattice-volumes",
@@ -80,44 +112,36 @@ export class IndexedDBVolumeCache implements VolumeCache {
   } = {}) {
     this.maximumBytes = maximumBytes;
     this.#now = now;
-    this.#database = this.#open(indexedDB, name).catch(() => null);
+    this.#database = open(indexedDB, name).catch(() => null);
   }
 
-  async #open(factory: IDBFactory | undefined, name: string): Promise<IDBDatabase | null> {
-    if (factory === undefined) return null;
-    const database = await request<IDBDatabase>(
-      Object.assign(factory.open(name, 1), {
-        onupgradeneeded: (event: IDBVersionChangeEvent) => {
-          const store = (event.target as IDBOpenDBRequest).result.createObjectStore(STORE, {
-            keyPath: "rootCID",
-          });
-          store.createIndex("used", "used");
-        },
-      }),
-    );
-    let bytes = 0;
-    await cursor(database.transaction(STORE).objectStore(STORE).openCursor(), (kept) => {
-      bytes += (kept.value as StoredVolume).bytes;
-    });
-    this.#bytes = bytes;
-    return database;
-  }
-
-  async get(rootCID: string): Promise<VerifiedVolume | undefined> {
+  async get(rootCID: string): Promise<SerializedVolume | undefined> {
     try {
       const database = await this.#database;
       if (database === null) return undefined;
-      const store = database.transaction(STORE, "readwrite").objectStore(STORE);
-      const kept = await request<StoredVolume | undefined>(store.get(rootCID));
-      if (kept === undefined) return undefined;
-      kept.used = this.#now();
-      store.put(kept);
-      return new VerifiedVolume(
-        kept.rootCID,
-        new Map(kept.entries.map((entry) => [entry.cid, entry.bytes])),
+      const kept = await request<unknown>(
+        database.transaction(VOLUMES).objectStore(VOLUMES).get(rootCID),
       );
+      if (kept === undefined) return undefined;
+      if (!isVolume(kept, rootCID)) {
+        void this.delete(rootCID);
+        return undefined;
+      }
+      void this.#touch(database, rootCID);
+      return kept;
     } catch {
       return undefined;
+    }
+  }
+
+  /** Marks `rootCID` used now: a few bytes written, never the Volume. */
+  async #touch(database: IDBDatabase, rootCID: string): Promise<void> {
+    try {
+      const used = database.transaction(USED, "readwrite").objectStore(USED);
+      const record = await request<unknown>(used.get(rootCID));
+      if (isUsed(record)) used.put({ ...record, used: this.#now() });
+    } catch {
+      // Its age is a little off: it may be dropped a little early.
     }
   }
 
@@ -128,26 +152,89 @@ export class IndexedDBVolumeCache implements VolumeCache {
       const entries = volume.entries();
       const bytes = volumeBytes(entries);
       if (bytes > this.maximumBytes) return;
-      const store = database.transaction(STORE, "readwrite").objectStore(STORE);
-      if ((await request(store.count(volume.rootCID))) > 0) return;
-      await request(store.put({ rootCID: volume.rootCID, entries, bytes, used: this.#now() }));
-      this.#bytes += bytes;
-      if (this.#bytes > this.maximumBytes) await this.#evict(database);
+      const transaction = database.transaction([VOLUMES, USED, TOTAL], "readwrite");
+      const volumes = transaction.objectStore(VOLUMES);
+      const used = transaction.objectStore(USED);
+      const totals = transaction.objectStore(TOTAL);
+      const done = completion(transaction);
+      if ((await request(volumes.count(volume.rootCID))) > 0) return void (await done);
+      let total = await totalOf(totals, used);
+      volumes.put({ rootCID: volume.rootCID, entries });
+      used.put({ rootCID: volume.rootCID, bytes, used: this.#now() });
+      total += bytes;
+      // The least recently used go first, in the same transaction.
+      await cursor(used.index("used").openCursor(), (oldest) => {
+        if (total <= this.maximumBytes) return false;
+        const record = oldest.value as unknown;
+        if (isUsed(record)) total -= record.bytes;
+        volumes.delete(oldest.primaryKey);
+        oldest.delete();
+        return true;
+      });
+      totals.put(Math.max(0, total), TOTAL);
+      await done;
     } catch {
       // Not kept: read again next time.
     }
   }
 
-  /** Drops the least recently used until the rest fit. */
-  async #evict(database: IDBDatabase): Promise<void> {
-    const store = database.transaction(STORE, "readwrite").objectStore(STORE);
-    await cursor(store.index("used").openCursor(), (oldest) => {
-      if (this.#bytes <= this.maximumBytes) return false;
-      this.#bytes -= (oldest.value as StoredVolume).bytes;
-      oldest.delete();
-      return true;
-    });
+  async delete(rootCID: string): Promise<void> {
+    try {
+      const database = await this.#database;
+      if (database === null) return;
+      const transaction = database.transaction([VOLUMES, USED, TOTAL], "readwrite");
+      const used = transaction.objectStore(USED);
+      const totals = transaction.objectStore(TOTAL);
+      const done = completion(transaction);
+      const total = await totalOf(totals, used);
+      const record = await request<unknown>(used.get(rootCID));
+      transaction.objectStore(VOLUMES).delete(rootCID);
+      used.delete(rootCID);
+      totals.put(Math.max(0, total - (isUsed(record) ? record.bytes : 0)), TOTAL);
+      await done;
+    } catch {
+      // Left as it is; it fails verification again next time.
+    }
   }
+}
+
+async function open(factory: IDBFactory | undefined, name: string): Promise<IDBDatabase | null> {
+  if (factory === undefined) return null;
+  const opening = factory.open(name, 1);
+  opening.onupgradeneeded = () => {
+    const database = opening.result;
+    database.createObjectStore(VOLUMES, { keyPath: "rootCID" });
+    database.createObjectStore(USED, { keyPath: "rootCID" }).createIndex("used", "used");
+    database.createObjectStore(TOTAL);
+  };
+  const database = await new Promise<IDBDatabase | null>((resolve, reject) => {
+    opening.onsuccess = () => resolve(opening.result);
+    opening.onerror = () => reject(opening.error);
+    // Another tab holds an older version open: keep nothing this visit.
+    opening.onblocked = () => resolve(null);
+  });
+  // A newer version elsewhere: let it open.
+  if (database !== null) database.onversionchange = () => database.close();
+  return database;
+}
+
+/**
+ * The total kept, as stored; counted again from the records when the stored
+ * one is missing or not a size, and records that aren't sizes are dropped.
+ */
+async function totalOf(totals: IDBObjectStore, used: IDBObjectStore): Promise<number> {
+  const stored = await request<unknown>(totals.get(TOTAL));
+  if (Number.isSafeInteger(stored) && (stored as number) >= 0) return stored as number;
+  let total = 0;
+  const volumes = used.transaction.objectStore(VOLUMES);
+  await cursor(used.openCursor(), (record) => {
+    if (isUsed(record.value)) total += record.value.bytes;
+    else {
+      volumes.delete(record.primaryKey);
+      record.delete();
+    }
+  });
+  return total;
 }
 
 function request<T>(pending: IDBRequest<T>): Promise<T> {
@@ -155,6 +242,17 @@ function request<T>(pending: IDBRequest<T>): Promise<T> {
     pending.onsuccess = () => resolve(pending.result);
     pending.onerror = () => reject(pending.error);
   });
+}
+
+/** Resolves once `transaction` commits; rejects if it aborts. */
+function completion(transaction: IDBTransaction): Promise<void> {
+  const done = new Promise<void>((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error);
+    transaction.onerror = () => reject(transaction.error);
+  });
+  done.catch(() => {});
+  return done;
 }
 
 /** Visits each record until `visit` returns false. */

@@ -100,7 +100,7 @@ test("IndexedDB keeps Volumes across instances, dropping the least recently used
   await first.put(b!);
   // A later visit: what was kept is there, checked bytes and all.
   const second = new IndexedDBVolumeCache({ indexedDB, maximumBytes: size * 2, now });
-  assert.deepEqual((await second.get(a!.rootCID))?.rootBytes(), a!.rootBytes());
+  assert.deepEqual((await second.get(a!.rootCID))?.entries[0]?.bytes, a!.rootBytes());
   await second.put(c!);
   assert.equal(await second.get(b!.rootCID), undefined);
   assert.ok(await second.get(a!.rootCID));
@@ -251,4 +251,182 @@ test("truncated many-Volumes answers are refused", () => {
   const body = records([volumeOf(1n)]);
   assert.throws(() => decodeVolumeRecords(body.subarray(0, body.length - 1)), /truncated/);
   assert.deepEqual(decodeVolumeRecords(new Uint8Array()), []);
+});
+
+/** Writes `record` straight into the cache's store, as another script on the origin could. */
+async function plant(indexedDB: IDBFactory, store: string, record: unknown, key?: string) {
+  const database = await new Promise<IDBDatabase>((resolve, reject) => {
+    const opening = indexedDB.open("lattice-volumes", 1);
+    opening.onsuccess = () => resolve(opening.result);
+    opening.onerror = () => reject(opening.error);
+  });
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(store, "readwrite");
+    if (key === undefined) transaction.objectStore(store).put(record);
+    else transaction.objectStore(store).put(record, key);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  database.close();
+}
+
+test("a kept Volume that fails verification is a miss, read from the node and dropped", async () => {
+  const indexedDB = new IDBFactory();
+  const [real, other] = [volumeOf("real"), volumeOf("other")];
+  const cache = new IndexedDBVolumeCache({ indexedDB });
+  await cache.get(real.rootCID); // opened, stores made
+  await plant(indexedDB, "volumes", { rootCID: real.rootCID, entries: other.entries });
+  const transport = counted([real]);
+  const client = new VolumeClient(transport, undefined, { cache });
+  assert.deepEqual((await client.get(real.rootCID)).rootBytes(), real.entries[0]!.bytes);
+  assert.deepEqual(transport.asked, [real.rootCID]);
+  await settle();
+  // The forged one is gone; the real one, verified, kept in its place.
+  assert.deepEqual((await cache.get(real.rootCID))?.entries, real.entries);
+});
+
+test("a kept Volume is held to the reading client's limits", async () => {
+  const big = volumeOf("x".repeat(500));
+  const cache = new MemoryVolumeCache();
+  await cache.put(verifyVolume(big, big.rootCID));
+  const strict = new VolumeClient(
+    new MemoryVolumeTransport([]),
+    { maximumEntries: 10, maximumBytes: 100 },
+    { cache },
+  );
+  // Over this client's limits: not taken from the cache, so read (and not found) here.
+  await assert.rejects(strict.get(big.rootCID), /not found/);
+});
+
+test("a cache that never answers keeps a read waiting only a moment", async () => {
+  const volume = volumeOf(5n);
+  const hung = { get: () => new Promise<undefined>(() => {}), put: async () => {} };
+  const client = new VolumeClient(new MemoryVolumeTransport([volume]), undefined, {
+    cache: hung,
+    cacheWaitMilliseconds: 10,
+  });
+  assert.equal((await client.get(volume.rootCID)).rootCID, volume.rootCID);
+  const throwing = {
+    get: () => {
+      throw new Error("sync");
+    },
+    put: async () => {},
+  };
+  const other = new VolumeClient(new MemoryVolumeTransport([volume]), undefined, {
+    cache: throwing,
+  });
+  assert.equal((await other.get(volume.rootCID)).rootCID, volume.rootCID);
+});
+
+test("records that aren't sizes are dropped, and the bound still holds", async () => {
+  const indexedDB = new IDBFactory();
+  const volumes = ["a", "b", "c", "d", "e"].map((v) =>
+    verifyVolume(volumeOf(v), volumeOf(v).rootCID),
+  );
+  const size = volumes[0]!.entries()[0]!.bytes.byteLength;
+  const cache = new IndexedDBVolumeCache({ indexedDB, maximumBytes: size * 2 });
+  await cache.get("x");
+  await plant(indexedDB, "used", { rootCID: "legacy", used: 0 });
+  await plant(indexedDB, "total", Number.NaN, "total");
+  for (const volume of volumes) await cache.put(volume);
+  const kept = await Promise.all(volumes.map((v) => cache.get(v.rootCID)));
+  assert.equal(kept.filter(Boolean).length, 2);
+});
+
+test("tabs sharing the database keep one total", async () => {
+  const indexedDB = new IDBFactory();
+  const volumes = ["a", "b", "c", "d"].map((v) => verifyVolume(volumeOf(v), volumeOf(v).rootCID));
+  const size = volumes[0]!.entries()[0]!.bytes.byteLength;
+  const one = new IndexedDBVolumeCache({ indexedDB, maximumBytes: size * 3 });
+  const two = new IndexedDBVolumeCache({ indexedDB, maximumBytes: size * 3 });
+  for (const [n, volume] of volumes.entries()) await (n % 2 ? two : one).put(volume);
+  const kept = await Promise.all(volumes.map((v) => one.get(v.rootCID)));
+  assert.equal(kept.filter(Boolean).length, 3);
+});
+
+test("a transport that throws at once fails its reads instead of leaving them waiting", async () => {
+  const transport: ManyVolumeTransport = {
+    getVolume: () => {
+      throw new Error("refused at once");
+    },
+    getVolumes: async () => new Map(),
+  };
+  const batching = new BatchingVolumeTransport(transport);
+  const reads = [batching.getVolume("bafya"), batching.getVolume("bafyb")];
+  for (const read of reads) await assert.rejects(read, /refused at once/);
+});
+
+test("an abort reaches the fetch once no other read waits on it", async () => {
+  const signals: (AbortSignal | undefined)[] = [];
+  const transport: ManyVolumeTransport = {
+    getVolume: (_root, signal) => {
+      signals.push(signal);
+      return new Promise((_, reject) =>
+        signal?.addEventListener("abort", () => reject(signal.reason)),
+      );
+    },
+    getVolumes: async () => new Map(),
+  };
+  const batching = new BatchingVolumeTransport(transport);
+  const [first, second] = [new AbortController(), new AbortController()];
+  const reads = [
+    batching.getVolume("bafya", first.signal),
+    batching.getVolume("bafya", second.signal),
+  ];
+  await settle();
+  first.abort(new Error("first"));
+  await assert.rejects(reads[0]!, /first/);
+  assert.equal(signals[0]?.aborted, false); // the second still waits on it
+  second.abort(new Error("second"));
+  await assert.rejects(reads[1]!, /second/);
+  assert.equal(signals[0]?.aborted, true);
+});
+
+test("after a failed many-Volumes request, reads go one at a time for a while", async () => {
+  let clock = 0;
+  const volumes = [volumeOf(1n), volumeOf(2n)];
+  const memory = new MemoryVolumeTransport(volumes);
+  let manyAsked = 0;
+  const transport: ManyVolumeTransport = {
+    getVolume: (root) => memory.getVolume(root),
+    getVolumes: async () => {
+      manyAsked += 1;
+      throw new VolumeTransportError("busy", 503);
+    },
+  };
+  const batching = new BatchingVolumeTransport(transport, {
+    backoffMilliseconds: 100,
+    now: () => clock,
+  });
+  const round = () => Promise.all(volumes.map((v) => batching.getVolume(v.rootCID)));
+  await round();
+  await round();
+  assert.equal(manyAsked, 1);
+  clock = 200;
+  await round();
+  assert.equal(manyAsked, 2);
+});
+
+test("reads behind an IndexedDB cache are still asked together", async () => {
+  const volumes = [volumeOf(1n), volumeOf(2n), volumeOf(3n), volumeOf(4n)];
+  const { transport, requests } = many(volumes);
+  const cache = new IndexedDBVolumeCache({ indexedDB: new IDBFactory() });
+  const client = new VolumeClient(new BatchingVolumeTransport(transport), undefined, { cache });
+  await Promise.all(volumes.map((v) => client.get(v.rootCID)));
+  assert.deepEqual(requests, [volumes.map((v) => v.rootCID)]);
+});
+
+test("a many-Volumes request that can't reach the node fails its reads at once", async () => {
+  const asked: string[] = [];
+  const transport: ManyVolumeTransport = {
+    getVolume: async (root) => (asked.push(root), null),
+    getVolumes: async () => {
+      throw new TypeError("Failed to fetch");
+    },
+  };
+  const batching = new BatchingVolumeTransport(transport);
+  const reads = [batching.getVolume("bafya"), batching.getVolume("bafyb")];
+  for (const read of reads) await assert.rejects(read, /Failed to fetch/);
+  // Not asked again one by one on the same node: the reader moves on.
+  assert.deepEqual(asked, []);
 });

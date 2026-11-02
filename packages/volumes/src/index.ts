@@ -143,12 +143,15 @@ export function verifyVolume(
 export interface VolumeClientOptions {
   /** Where Volumes are kept once verified, and looked for first. */
   readonly cache?: VolumeCache;
+  /** How long a read waits on the cache before reading past it. */
+  readonly cacheWaitMilliseconds?: number;
 }
 
 export class VolumeClient {
   readonly #transport: VolumeTransport;
   readonly #limits: VolumeLimits;
   readonly #cache: VolumeCache | undefined;
+  readonly #cacheWait: number;
 
   constructor(
     transport: VolumeTransport,
@@ -158,17 +161,58 @@ export class VolumeClient {
     this.#transport = transport;
     this.#limits = limits;
     this.#cache = options.cache;
+    this.#cacheWait = options.cacheWaitMilliseconds ?? 1_000;
   }
 
   async get(rootCID: string, signal?: AbortSignal): Promise<VerifiedVolume> {
-    const kept = await this.#cache?.get(rootCID).catch(() => undefined);
-    if (kept !== undefined && kept.rootCID === rootCID) return kept;
+    const kept = await this.#kept(rootCID, signal);
+    if (kept !== undefined) return kept;
+    signal?.throwIfAborted();
     const serialized = await this.#transport.getVolume(rootCID, signal);
     if (serialized === null) throw new VolumeError("not-found", `Volume ${rootCID} was not found`);
     const volume = verifyVolume(serialized, rootCID, this.#limits);
     // Kept only once verified; keeping it never holds up the read.
-    void this.#cache?.put(volume).catch(() => {});
+    const cache = this.#cache;
+    if (cache !== undefined)
+      void Promise.resolve()
+        .then(() => cache.put(volume))
+        .catch(() => {});
     return volume;
+  }
+
+  /**
+   * The cache's Volume for `rootCID`, verified here under this client's
+   * limits as if it had just been fetched; a Volume that fails is dropped
+   * from the cache. A cache that fails, or keeps the read waiting past
+   * `cacheWaitMilliseconds` or its abort, is a miss.
+   */
+  async #kept(rootCID: string, signal?: AbortSignal): Promise<VerifiedVolume | undefined> {
+    const cache = this.#cache;
+    if (cache === undefined) return undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abort: (() => void) | undefined;
+    const kept = await Promise.race([
+      Promise.resolve().then(() => cache.get(rootCID)),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), this.#cacheWait);
+        abort = () => resolve(undefined);
+        signal?.addEventListener("abort", abort, { once: true });
+      }),
+    ])
+      .catch(() => undefined)
+      .finally(() => {
+        clearTimeout(timer);
+        if (abort !== undefined) signal?.removeEventListener("abort", abort);
+      });
+    if (kept === undefined) return undefined;
+    try {
+      return verifyVolume(kept, rootCID, this.#limits);
+    } catch {
+      void Promise.resolve()
+        .then(() => cache.delete?.(rootCID))
+        .catch(() => {});
+      return undefined;
+    }
   }
 }
 

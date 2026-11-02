@@ -15,43 +15,75 @@ export interface ManyVolumeTransport extends VolumeTransport {
 export interface BatchingVolumeTransportOptions {
   /** Roots asked in one request at most; the node's bound is 32. */
   readonly maximumBatch?: number;
-  /** How long a read waits for others to join its request. */
+  /**
+   * How long a read waits for others to join its request: a few
+   * milliseconds, so reads that each looked in a cache first (answered in
+   * separate tasks) still meet.
+   */
   readonly windowMilliseconds?: number;
+  /** How long reads go one at a time after a many-Volumes request fails. */
+  readonly backoffMilliseconds?: number;
+  readonly now?: () => number;
 }
 
 interface Waiting {
   readonly rootCID: string;
+  readonly signal: AbortSignal | undefined;
   readonly resolve: (volume: SerializedVolume | null) => void;
   readonly reject: (error: unknown) => void;
+}
+
+/** Aborts once every one of `signals` has; never, if any read can't be aborted. */
+function allAborted(signals: readonly (AbortSignal | undefined)[]): AbortSignal | undefined {
+  if (signals.some((signal) => signal === undefined)) return undefined;
+  if (signals.length === 1) return signals[0];
+  const all = new AbortController();
+  const check = () => {
+    if (signals.every((signal) => signal!.aborted)) all.abort(signals[0]!.reason);
+  };
+  for (const signal of signals) signal!.addEventListener("abort", check, { once: true });
+  check();
+  return all.signal;
 }
 
 /**
  * Reads made together, as a walk reads a node's children, asked in one
  * request: each `getVolume` waits `windowMilliseconds` for others, and the
- * lot goes to `getVolumes`. A root the answer leaves out is read on its own,
- * and so is everything once the transport can't be asked for many (a node
- * without the route, say). Only a read's own fetch is ever aborted by its
- * signal; it never aborts the request it shares.
+ * lot goes to `getVolumes`. A root the answer leaves out is read on its own.
+ * A gateway that refuses the route (400, 403, 404, 405, 501) is read one at
+ * a time from then on; one whose answer fails otherwise, for
+ * `backoffMilliseconds`; one that can't be reached fails the reads at once.
+ * A read's abort ends that read, and its fetch once no other read waits on
+ * it.
  */
 export class BatchingVolumeTransport implements VolumeTransport {
   readonly #transport: ManyVolumeTransport;
   readonly #maximumBatch: number;
   readonly #window: number;
+  readonly #backoff: number;
+  readonly #now: () => number;
   #waiting: Waiting[] = [];
   #timer: ReturnType<typeof setTimeout> | undefined;
-  #many = true;
+  /** Until when reads go one at a time: Infinity once the route is refused. */
+  #aloneUntil = 0;
 
   constructor(transport: ManyVolumeTransport, options: BatchingVolumeTransportOptions = {}) {
     this.#transport = transport;
     this.#maximumBatch = options.maximumBatch ?? 32;
-    this.#window = options.windowMilliseconds ?? 0;
+    this.#window = options.windowMilliseconds ?? 4;
+    this.#backoff = options.backoffMilliseconds ?? 30_000;
+    this.#now = options.now ?? Date.now;
+  }
+
+  #alone(rootCID: string, signal?: AbortSignal): Promise<SerializedVolume | null> {
+    return Promise.resolve().then(() => this.#transport.getVolume(rootCID, signal));
   }
 
   getVolume(rootCID: string, signal?: AbortSignal): Promise<SerializedVolume | null> {
-    if (!this.#many) return this.#transport.getVolume(rootCID, signal);
-    signal?.throwIfAborted();
+    if (this.#now() < this.#aloneUntil) return this.#alone(rootCID, signal);
+    if (signal?.aborted) return Promise.reject(signal.reason);
     const read = new Promise<SerializedVolume | null>((resolve, reject) => {
-      this.#waiting.push({ rootCID, resolve, reject });
+      this.#waiting.push({ rootCID, signal, resolve, reject });
     });
     if (this.#waiting.length >= this.#maximumBatch) this.#flush();
     else this.#timer ??= setTimeout(() => this.#flush(), this.#window);
@@ -66,36 +98,46 @@ export class BatchingVolumeTransport implements VolumeTransport {
   #flush(): void {
     clearTimeout(this.#timer);
     this.#timer = undefined;
-    const batch = this.#waiting;
+    // A read already aborted has its answer: nothing to fetch for it.
+    const batch = this.#waiting.filter(({ signal }) => !signal?.aborted);
     this.#waiting = [];
-    void this.#ask(batch);
+    void this.#ask(batch).catch((error: unknown) => {
+      for (const { reject } of batch) reject(error);
+    });
   }
 
   async #ask(batch: readonly Waiting[]): Promise<void> {
-    const roots = [...new Set(batch.map(({ rootCID }) => rootCID))];
+    const byRoot = new Map<string, Waiting[]>();
+    for (const waiting of batch) {
+      byRoot.set(waiting.rootCID, [...(byRoot.get(waiting.rootCID) ?? []), waiting]);
+    }
     let found = new Map<string, SerializedVolume>();
-    if (roots.length > 1 && this.#many) {
+    if (byRoot.size > 1 && this.#now() >= this.#aloneUntil) {
       try {
-        found = await this.#transport.getVolumes(roots);
+        found = await this.#transport.getVolumes([...byRoot.keys()]);
       } catch (error) {
-        // Not a route here: each read goes on its own from now on.
-        if (
-          error instanceof VolumeTransportError &&
-          [400, 403, 404, 405, 501].includes(error.status ?? 0)
-        ) {
-          this.#many = false;
+        // The node can't be reached or didn't answer: the reads fail now, so
+        // the reader can move on, rather than waiting on it once per root.
+        if (!(error instanceof VolumeTransportError)) {
+          for (const waiting of batch) waiting.reject(error);
+          return;
         }
+        const refused =
+          error instanceof VolumeTransportError &&
+          [400, 403, 404, 405, 501].includes(error.status ?? 0);
+        this.#aloneUntil = refused ? Infinity : this.#now() + this.#backoff;
       }
     }
-    const alone = new Map<string, Promise<SerializedVolume | null>>();
-    for (const { rootCID, resolve, reject } of batch) {
+    for (const [rootCID, waiting] of byRoot) {
       const volume = found.get(rootCID);
-      if (volume !== undefined) {
-        resolve(volume);
-        continue;
-      }
-      if (!alone.has(rootCID)) alone.set(rootCID, this.#transport.getVolume(rootCID));
-      alone.get(rootCID)!.then(resolve, reject);
+      const read =
+        volume !== undefined
+          ? Promise.resolve(volume)
+          : this.#alone(rootCID, allAborted(waiting.map(({ signal }) => signal)));
+      read.then(
+        (answer) => waiting.forEach(({ resolve }) => resolve(answer)),
+        (error: unknown) => waiting.forEach(({ reject }) => reject(error)),
+      );
     }
   }
 }
