@@ -1,5 +1,11 @@
 import { assertCID, decodeDagCbor, type DagCborValue } from "@adalin/lattice-core";
 
+import { decodeVolumeRecords, type ManyVolumeTransport, MANY_VOLUMES_MEDIA_TYPE } from "./batch.js";
+import type { VolumeCache } from "./cache.js";
+
+export * from "./batch.js";
+export * from "./cache.js";
+
 export interface VolumeEntry {
   readonly cid: string;
   readonly bytes: Uint8Array;
@@ -134,19 +140,79 @@ export function verifyVolume(
   return new VerifiedVolume(expectedRoot, entries);
 }
 
+export interface VolumeClientOptions {
+  /** Where Volumes are kept once verified, and looked for first. */
+  readonly cache?: VolumeCache;
+  /** How long a read waits on the cache before reading past it. */
+  readonly cacheWaitMilliseconds?: number;
+}
+
 export class VolumeClient {
   readonly #transport: VolumeTransport;
   readonly #limits: VolumeLimits;
+  readonly #cache: VolumeCache | undefined;
+  readonly #cacheWait: number;
 
-  constructor(transport: VolumeTransport, limits: VolumeLimits = DEFAULT_VOLUME_LIMITS) {
+  constructor(
+    transport: VolumeTransport,
+    limits: VolumeLimits = DEFAULT_VOLUME_LIMITS,
+    options: VolumeClientOptions = {},
+  ) {
     this.#transport = transport;
     this.#limits = limits;
+    this.#cache = options.cache;
+    this.#cacheWait = options.cacheWaitMilliseconds ?? 1_000;
   }
 
   async get(rootCID: string, signal?: AbortSignal): Promise<VerifiedVolume> {
+    const kept = await this.#kept(rootCID, signal);
+    if (kept !== undefined) return kept;
+    signal?.throwIfAborted();
     const serialized = await this.#transport.getVolume(rootCID, signal);
     if (serialized === null) throw new VolumeError("not-found", `Volume ${rootCID} was not found`);
-    return verifyVolume(serialized, rootCID, this.#limits);
+    const volume = verifyVolume(serialized, rootCID, this.#limits);
+    // Kept only once verified; keeping it never holds up the read.
+    const cache = this.#cache;
+    if (cache !== undefined)
+      void Promise.resolve()
+        .then(() => cache.put(volume))
+        .catch(() => {});
+    return volume;
+  }
+
+  /**
+   * The cache's Volume for `rootCID`, verified here under this client's
+   * limits as if it had just been fetched; a Volume that fails is dropped
+   * from the cache. A cache that fails, or keeps the read waiting past
+   * `cacheWaitMilliseconds` or its abort, is a miss.
+   */
+  async #kept(rootCID: string, signal?: AbortSignal): Promise<VerifiedVolume | undefined> {
+    const cache = this.#cache;
+    if (cache === undefined) return undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abort: (() => void) | undefined;
+    const kept = await Promise.race([
+      Promise.resolve().then(() => cache.get(rootCID)),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), this.#cacheWait);
+        abort = () => resolve(undefined);
+        signal?.addEventListener("abort", abort, { once: true });
+      }),
+    ])
+      .catch(() => undefined)
+      .finally(() => {
+        clearTimeout(timer);
+        if (abort !== undefined) signal?.removeEventListener("abort", abort);
+      });
+    if (kept === undefined) return undefined;
+    try {
+      return verifyVolume(kept, rootCID, this.#limits);
+    } catch {
+      void Promise.resolve()
+        .then(() => cache.delete?.(rootCID))
+        .catch(() => {});
+      return undefined;
+    }
   }
 }
 
@@ -353,10 +419,11 @@ async function boundedBytes(response: Response, maximumBytes: number): Promise<U
 
 /**
  * Complete-Volume gateway transport. The gateway serves Ivy's canonical
- * binary archive from `GET <base>/<root CID>`; it does not expose a second
- * JSON representation of canonical content.
+ * binary archive from `GET <base>/<root CID>`, and many at once from
+ * `GET <base>?cids=<root>,<root>,...`; it does not expose a second JSON
+ * representation of canonical content.
  */
-export class HTTPVolumeTransport implements VolumeTransport {
+export class HTTPVolumeTransport implements ManyVolumeTransport {
   readonly endpoint: string;
   readonly #fetch: (input: string | URL, init?: RequestInit) => Promise<Response>;
   readonly #timeoutMilliseconds: number;
@@ -409,6 +476,50 @@ export class HTTPVolumeTransport implements VolumeTransport {
     }
     const archive = await boundedBytes(response, MAXIMUM_VOLUME_ARCHIVE_BYTES);
     return decodeVolumeArchive(rootCID, archive, this.#limits);
+  }
+
+  /**
+   * The Volumes the gateway holds of `rootCIDs`, in one request. A record
+   * for a root not asked for is ignored; one that fails to decode fails the
+   * lot, as a single read would.
+   */
+  async getVolumes(
+    rootCIDs: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<Map<string, SerializedVolume>> {
+    const url = new URL(this.endpoint.replace(/\/+$/, ""));
+    url.searchParams.set("cids", rootCIDs.join(","));
+    if (this.#chainPath !== undefined) url.searchParams.set("chainPath", this.#chainPath);
+    const timeout = AbortSignal.timeout(this.#timeoutMilliseconds);
+    const combined = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
+    const response = await this.#fetch(url, {
+      headers: {
+        Accept: MANY_VOLUMES_MEDIA_TYPE,
+        ...(this.#authorization === undefined ? {} : { Authorization: this.#authorization }),
+      },
+      redirect: "error",
+      signal: combined,
+    });
+    if (!response.ok)
+      throw new VolumeTransportError(
+        `content gateway returned HTTP ${response.status}`,
+        response.status,
+      );
+    const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+    if (mediaType !== MANY_VOLUMES_MEDIA_TYPE) {
+      throw new VolumeTransportError(
+        `content gateway returned ${mediaType ?? "no content type"}`,
+        response.status,
+      );
+    }
+    const asked = new Set(rootCIDs);
+    const found = new Map<string, SerializedVolume>();
+    const body = await boundedBytes(response, MAXIMUM_VOLUME_ARCHIVE_BYTES);
+    for (const { rootCID, archive } of decodeVolumeRecords(body)) {
+      if (asked.has(rootCID))
+        found.set(rootCID, decodeVolumeArchive(rootCID, archive, this.#limits));
+    }
+    return found;
   }
 }
 
