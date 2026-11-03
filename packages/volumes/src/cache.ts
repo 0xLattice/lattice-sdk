@@ -93,25 +93,40 @@ const isVolume = (value: unknown, rootCID: string): value is SerializedVolume =>
  * used dropped past `maximumBytes`. Where IndexedDB is missing, refuses or
  * is held by another version (a private window, storage blocked or full), it
  * keeps nothing.
+ *
+ * A lookup costs little: lookups made together (a trie walk asks for a
+ * node's children at once) share one transaction, and a hit's "last used"
+ * is written later, with the others made meanwhile, in one transaction
+ * `touchAfterMilliseconds` on, or sooner, inside the next `put` (before it
+ * decides what to drop).
  */
 export class IndexedDBVolumeCache implements VolumeCache {
   readonly maximumBytes: number;
   readonly #database: Promise<IDBDatabase | null>;
   readonly #now: () => number;
+  readonly #touchAfter: number;
+  // The read transaction lookups share while it is active.
+  #reading: IDBObjectStore | null = null;
+  // Hits not yet written as used: root CID → when.
+  readonly #touched = new Map<string, number>();
+  #touching: ReturnType<typeof setTimeout> | null = null;
 
   constructor({
     name = "lattice-volumes",
     maximumBytes = 64 * 1024 * 1024,
     indexedDB = globalThis.indexedDB,
     now = Date.now,
+    touchAfterMilliseconds = 1000,
   }: {
     name?: string;
     maximumBytes?: number;
     indexedDB?: IDBFactory | undefined;
     now?: () => number;
+    touchAfterMilliseconds?: number;
   } = {}) {
     this.maximumBytes = maximumBytes;
     this.#now = now;
+    this.#touchAfter = touchAfterMilliseconds;
     this.#database = open(indexedDB, name).catch(() => null);
   }
 
@@ -119,30 +134,71 @@ export class IndexedDBVolumeCache implements VolumeCache {
     try {
       const database = await this.#database;
       if (database === null) return undefined;
-      const kept = await request<unknown>(
-        database.transaction(VOLUMES).objectStore(VOLUMES).get(rootCID),
-      );
+      const kept = await request<unknown>(this.#lookup(database, rootCID));
       if (kept === undefined) return undefined;
       if (!isVolume(kept, rootCID)) {
         void this.delete(rootCID);
         return undefined;
       }
-      void this.#touch(database, rootCID);
+      this.#touch(rootCID);
       return kept;
     } catch {
       return undefined;
     }
   }
 
-  /** Marks `rootCID` used now: a few bytes written, never the Volume. */
-  async #touch(database: IDBDatabase, rootCID: string): Promise<void> {
-    try {
-      const used = database.transaction(USED, "readwrite").objectStore(USED);
-      const record = await request<unknown>(used.get(rootCID));
-      if (isUsed(record)) used.put({ ...record, used: this.#now() });
-    } catch {
-      // Its age is a little off: it may be dropped a little early.
+  /** A lookup in the read transaction now active, or in a new one. */
+  #lookup(database: IDBDatabase, rootCID: string): IDBRequest<unknown> {
+    if (this.#reading !== null) {
+      try {
+        return this.#reading.get(rootCID);
+      } catch {
+        // It has finished: lookups from here on start another.
+      }
     }
+    const transaction = database.transaction(VOLUMES);
+    const store = transaction.objectStore(VOLUMES);
+    this.#reading = store;
+    const finished = () => {
+      if (this.#reading === store) this.#reading = null;
+    };
+    transaction.oncomplete = finished;
+    transaction.onabort = finished;
+    return store.get(rootCID);
+  }
+
+  /** Marks `rootCID` used now, written with the others in a moment. */
+  #touch(rootCID: string): void {
+    this.#touched.set(rootCID, this.#now());
+    this.#touching ??= setTimeout(() => void this.#writeTouches(), this.#touchAfter);
+  }
+
+  /** Writes the hits made since the last write, in one transaction. */
+  async #writeTouches(): Promise<void> {
+    this.#touching = null;
+    if (this.#touched.size === 0) return;
+    try {
+      const database = await this.#database;
+      if (database === null) return;
+      const transaction = database.transaction(USED, "readwrite");
+      const done = completion(transaction);
+      await this.#applyTouches(transaction.objectStore(USED));
+      await done;
+    } catch {
+      // Their ages are a little off: they may be dropped a little early.
+    }
+  }
+
+  /** Writes the pending hits as used, in `used`'s transaction: a few bytes each, never the Volume. */
+  async #applyTouches(used: IDBObjectStore): Promise<void> {
+    const touched = [...this.#touched];
+    this.#touched.clear();
+    const records = await Promise.all(
+      touched.map(([rootCID]) => request<unknown>(used.get(rootCID))),
+    );
+    records.forEach((record, n) => {
+      if (isUsed(record)) used.put({ ...record, used: Math.max(record.used, touched[n]![1]) });
+    });
   }
 
   async put(volume: VerifiedVolume): Promise<void> {
@@ -157,6 +213,8 @@ export class IndexedDBVolumeCache implements VolumeCache {
       const used = transaction.objectStore(USED);
       const totals = transaction.objectStore(TOTAL);
       const done = completion(transaction);
+      // What was used meanwhile counts as used before anything is dropped.
+      await this.#applyTouches(used);
       if ((await request(volumes.count(volume.rootCID))) > 0) return void (await done);
       let total = await totalOf(totals, used);
       volumes.put({ rootCID: volume.rootCID, entries });

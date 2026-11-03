@@ -48,7 +48,11 @@ const volumes = new VolumeClient(
 ```
 
 Both caches drop the least recently used Volumes past a byte bound
-(`maximumBytes`). A gateway without the many-Volumes route is read one Volume
+(`maximumBytes`). The IndexedDB cache's lookups made together share one
+transaction, and a hit's "last used" is written later, with the others,
+in one transaction (`touchAfterMilliseconds`, a second by default) or in
+the next `put`, so a hit costs about a hundredth of a millisecond in
+Chromium rather than a tenth or more. A gateway without the many-Volumes route is read one Volume
 at a time from its first refusal on.
 
 MIT
