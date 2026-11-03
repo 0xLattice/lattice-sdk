@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { IDBFactory } from "fake-indexeddb";
+import { IDBDatabase, IDBFactory } from "fake-indexeddb";
 
 import { cidV1DagCbor, encodeDagCbor } from "@adalin/lattice-core";
 import {
@@ -105,6 +105,46 @@ test("IndexedDB keeps Volumes across instances, dropping the least recently used
   assert.equal(await second.get(b!.rootCID), undefined);
   assert.ok(await second.get(a!.rootCID));
   assert.ok(await second.get(c!.rootCID));
+});
+
+test("IndexedDB lookups made together share one transaction, and hits are written as used later, together", async () => {
+  const indexedDB = new IDBFactory();
+  let clock = 0;
+  const now = () => ++clock;
+  const volumes = ["a", "b", "c", "d"].map((v) => verifyVolume(volumeOf(v), volumeOf(v).rootCID));
+  const size = volumes[0]!.entries()[0]!.bytes.byteLength;
+  const cache = new IndexedDBVolumeCache({
+    indexedDB,
+    maximumBytes: size * 3,
+    now,
+    touchAfterMilliseconds: 10,
+  });
+  for (const v of volumes.slice(0, 3)) await cache.put(v);
+  const opened: IDBTransactionMode[] = [];
+  const transaction = IDBDatabase.prototype.transaction;
+  IDBDatabase.prototype.transaction = function (
+    this: IDBDatabase,
+    ...args: Parameters<typeof transaction>
+  ) {
+    opened.push(args[1] ?? "readonly");
+    return transaction.apply(this, args);
+  } as typeof transaction;
+  try {
+    const found = await Promise.all(volumes.slice(0, 3).map((v) => cache.get(v.rootCID)));
+    assert.ok(found.every(Boolean));
+    assert.deepEqual(opened, ["readonly"], "three lookups, one transaction, nothing written yet");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(opened, ["readonly", "readwrite"], "the three hits written as used in one");
+  } finally {
+    IDBDatabase.prototype.transaction = transaction;
+  }
+  // A, then B, used again just now: C is the least recently used, and goes first.
+  await cache.get(volumes[0]!.rootCID);
+  await cache.get(volumes[1]!.rootCID);
+  await cache.put(volumes[3]!);
+  const later = new IndexedDBVolumeCache({ indexedDB, maximumBytes: size * 3, now });
+  assert.equal(await later.get(volumes[2]!.rootCID), undefined);
+  for (const v of [volumes[0]!, volumes[1]!, volumes[3]!]) assert.ok(await later.get(v.rootCID));
 });
 
 test("without IndexedDB nothing is kept, and nothing fails", async () => {
