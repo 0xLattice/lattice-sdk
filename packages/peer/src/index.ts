@@ -280,7 +280,7 @@ export class ChainFollower {
     // ancestors, which it may connect through, are still on their way: then
     // its answer is taken again once they are in.
     if (this.baseRequest !== undefined && this.early.length < 16) {
-      this.early.push({ asked, entries: entries as Entry[] });
+      this.early.push({ asked, entries: (entries as Entry[]).slice(0, 64) });
     } else {
       this.waiting.delete(asked);
     }
