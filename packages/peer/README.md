@@ -23,7 +23,13 @@ const follower = new ChainFollower({
 
 The assurance is work, not validity: the follower does not execute blocks
 or check a block's target against its chain's schedule, so a miner may pick
-an easy target and a header can cost little. Work is counted from the first
-block the follower takes (the node's tip when it starts): branches are
-weighed against each other only from there, and a branch that does not
-connect to a block it holds within 64 ancestors is dropped.
+an easy target and a header can cost little.
+
+The node it connects to picks where it starts: the first header the
+follower takes (the node's tip) and that block's 64 ancestors are the
+window every branch is weighed in. A branch that does not connect to a
+block in the window is dropped; the follower cannot reorg below it. The
+node also controls liveness: it can withhold what it has. So the tip it
+reports is the heaviest connected branch, above that start, among the
+headers that one node sent, each of which hashes to its CID and carries
+the work it claims.

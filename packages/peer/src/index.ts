@@ -63,7 +63,10 @@ export interface FollowedBlock {
   readonly block: CanonicalBlock;
   /** The work this block's own proof of work shows. */
   readonly work: bigint;
-  /** Its work plus its known ancestors' since the follower started. */
+  /**
+   * Its work plus its ancestors' from one fixed block of this follower's:
+   * comparable between this follower's blocks only.
+   */
   readonly cumulativeWork: bigint;
 }
 
@@ -116,6 +119,8 @@ export class ChainFollower {
   private readonly waiting = new Map<string, Entry[]>();
   /** Open ancestors requests: their id, and the parent each asked for. */
   private readonly ancestorRequests = new Map<number, string>();
+  /** The request for the first block's own ancestors, while open. */
+  private baseRequest: number | undefined;
   private heaviest: FollowedBlock | undefined;
   /** Capabilities the node's hello named. */
   capabilities: readonly string[] = [];
@@ -248,6 +253,11 @@ export class ChainFollower {
       return;
     }
     const requestID = body.requestID;
+    if (requestID !== undefined && requestID === this.baseRequest) {
+      this.baseRequest = undefined;
+      this.extendDown(entries as Entry[]);
+      return;
+    }
     const asked = typeof requestID === "number" ? this.ancestorRequests.get(requestID) : undefined;
     if (asked === undefined) {
       for (const entry of entries as Entry[]) this.take(entry, false);
@@ -268,20 +278,9 @@ export class ChainFollower {
    * does not connect either is dropped.
    */
   private take(entry: Entry, fromAncestors: boolean) {
-    let bytes: Uint8Array;
-    try {
-      bytes = base64(entry.block);
-    } catch {
-      return;
-    }
-    const cid = cidV1DagCbor(bytes);
-    this.asked.delete(cid);
-    if (this.blocks.has(cid)) return;
-    const block = decodeLatticeBlock(bytes);
-    if (block === undefined) return this.options.onRejected?.(cid, "not a block");
-    const work = this.work(block, bytes, entry.proofs);
-    if (work === undefined)
-      return this.options.onRejected?.(cid, "its proof of work does not verify");
+    const checked = this.check(entry);
+    if (checked === undefined) return;
+    const { cid, block, work } = checked;
     const parent = block.parentCID === undefined ? undefined : this.blocks.get(block.parentCID);
     if (parent !== undefined && parent.block.height + 1n !== block.height) {
       return this.options.onRejected?.(cid, "its height does not follow its parent's");
@@ -315,15 +314,91 @@ export class ChainFollower {
       work,
       cumulativeWork: (parent?.cumulativeWork ?? 0n) + work,
     };
+    const first = this.heaviest === undefined;
     this.blocks.set(cid, followed);
     this.prune();
-    if (this.heaviest === undefined || followed.cumulativeWork > this.heaviest.cumulativeWork) {
+    // Heavier wins; equal work goes to the smaller CID, as in Lattice.
+    if (
+      this.heaviest === undefined ||
+      followed.cumulativeWork > this.heaviest.cumulativeWork ||
+      (followed.cumulativeWork === this.heaviest.cumulativeWork && cid < this.heaviest.cid)
+    ) {
       this.heaviest = followed;
       this.options.onTip?.(followed);
     }
+    if (first && block.parentCID !== undefined) {
+      // The first block's own ancestors, so a fork from just below it (a
+      // reorg of the tip) still connects.
+      this.baseRequest = this.nextRequestID++;
+      this.send(Topic.ancestorsRequest, {
+        chainPath: this.chainPath,
+        cid: block.parentCID,
+        maximum: 64,
+        requestID: this.baseRequest,
+      });
+    }
+    this.retakeWaiting(cid);
+  }
+
+  private retakeWaiting(cid: string) {
     const children = this.waiting.get(cid);
     this.waiting.delete(cid);
     for (const child of children ?? []) this.take(child, false);
+  }
+
+  /**
+   * The first block's ancestors, child to parent: each held below the one
+   * it is the parent of, its total that block's less that block's own work,
+   * so every branch is still weighed from one place.
+   */
+  private extendDown(entries: readonly Entry[]) {
+    let lowest = [...this.blocks.values()].reduce<FollowedBlock | undefined>(
+      (low, followed) =>
+        low === undefined || followed.block.height < low.block.height ? followed : low,
+      undefined,
+    );
+    for (const entry of entries) {
+      if (lowest === undefined) return;
+      const checked = this.check(entry);
+      if (
+        checked === undefined ||
+        checked.cid !== lowest.block.parentCID ||
+        checked.block.height + 1n !== lowest.block.height
+      ) {
+        return;
+      }
+      const followed: FollowedBlock = {
+        ...checked,
+        cumulativeWork: lowest.cumulativeWork - lowest.work,
+      };
+      this.blocks.set(checked.cid, followed);
+      lowest = followed;
+      this.retakeWaiting(checked.cid);
+    }
+  }
+
+  /** One header's CID, block and proven work; undefined if it shows none. */
+  private check(entry: Entry): { cid: string; block: CanonicalBlock; work: bigint } | undefined {
+    let bytes: Uint8Array;
+    try {
+      bytes = base64(entry.block);
+    } catch {
+      return undefined;
+    }
+    const cid = cidV1DagCbor(bytes);
+    this.asked.delete(cid);
+    if (this.blocks.has(cid)) return undefined;
+    const block = decodeLatticeBlock(bytes);
+    if (block === undefined) {
+      this.options.onRejected?.(cid, "not a block");
+      return undefined;
+    }
+    const work = this.work(block, bytes, entry.proofs);
+    if (work === undefined) {
+      this.options.onRejected?.(cid, "its proof of work does not verify");
+      return undefined;
+    }
+    return { cid, block, work };
   }
 
   /** The work `block`'s proof shows, or undefined when it shows none. */
@@ -364,10 +439,11 @@ export class ChainFollower {
   private prune() {
     const keep = this.options.keep ?? 4096;
     if (this.blocks.size <= keep + 256) return;
-    const oldest = [...this.blocks.values()].sort((a, b) =>
-      a.block.height < b.block.height ? -1 : 1,
+    // The lightest go first: old blocks and cheap branches, never the tip.
+    const lightest = [...this.blocks.values()].sort((a, b) =>
+      a.cumulativeWork < b.cumulativeWork ? -1 : a.cumulativeWork > b.cumulativeWork ? 1 : 0,
     );
-    for (const followed of oldest.slice(0, this.blocks.size - keep))
+    for (const followed of lightest.slice(0, this.blocks.size - keep))
       this.blocks.delete(followed.cid);
   }
 }

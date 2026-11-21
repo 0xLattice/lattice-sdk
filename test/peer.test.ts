@@ -255,3 +255,19 @@ test("payloads of the wrong shape are ignored, never thrown", () => {
   }
   assert.deepEqual(tips, []);
 });
+
+test("a reorg of the first block it took still connects, through that block's ancestors", () => {
+  const { peer, sent, headers } = nexusFollower();
+  const g = nexusBlock(undefined, 0, HALF);
+  const a1 = nexusBlock(g.cid, 1, HALF);
+  const x = nexusBlock(a1.cid, 2, HALF, "x");
+  headers([x.entry]);
+  const ask = JSON.parse(sent.at(-1)!.body);
+  assert.equal(ask.cid, a1.cid);
+  headers([a1.entry, g.entry], ask.requestID);
+  const y = nexusBlock(a1.cid, 2, HALF, "y"),
+    y3 = nexusBlock(y.cid, 3, HALF, "y");
+  headers([y.entry]);
+  headers([y3.entry]);
+  assert.equal(peer.tip?.cid, y3.cid);
+});
