@@ -7,3 +7,4 @@ export * from "./multikey.js";
 export * from "./signing.js";
 export * from "./transaction.js";
 export * from "./node-auth.js";
+export * from "./child-proof.js";

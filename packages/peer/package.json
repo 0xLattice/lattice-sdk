@@ -1,0 +1,32 @@
+{
+  "name": "@adalin/lattice-peer",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Follow a Lattice chain as an overlay peer, checking every header it is sent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0xLattice/lattice-sdk.git",
+    "directory": "packages/peer"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@adalin/lattice-core": "0.1.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

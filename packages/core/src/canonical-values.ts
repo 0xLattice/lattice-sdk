@@ -163,10 +163,10 @@ export function canonicalBlockProofOfWorkPreimage(block: CanonicalBlock): Uint8A
     String(block.version),
     block.parentCID ?? "",
     block.transactionsCID,
-    // UInt256.toHexString(), used by consensus, hashes the parsed value as
-    // minimal lower-case hex without the DAG-CBOR field's `0x` prefix.
-    targetInteger(block.target).toString(16),
-    targetInteger(block.nextTarget).toString(16),
+    // UInt256 2.0.0's toHexString(), used by consensus: all 64 lower-case
+    // hex digits, zero-padded, without the DAG-CBOR field's `0x` prefix.
+    targetInteger(block.target).toString(16).padStart(64, "0"),
+    targetInteger(block.nextTarget).toString(16).padStart(64, "0"),
     block.specCID,
     block.parentStateCID,
     block.previousStateCID,

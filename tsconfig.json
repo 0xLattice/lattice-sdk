@@ -1,10 +1,23 @@
 {
   "files": [],
   "references": [
-    { "path": "packages/core" },
-    { "path": "packages/volumes" },
-    { "path": "packages/client" },
-    { "path": "packages/relay" },
-    { "path": "packages/sdk" }
+    {
+      "path": "packages/core"
+    },
+    {
+      "path": "packages/volumes"
+    },
+    {
+      "path": "packages/peer"
+    },
+    {
+      "path": "packages/client"
+    },
+    {
+      "path": "packages/relay"
+    },
+    {
+      "path": "packages/sdk"
+    }
   ]
 }
