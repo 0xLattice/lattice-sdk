@@ -271,3 +271,20 @@ test("a reorg of the first block it took still connects, through that block's an
   headers([y3.entry]);
   assert.equal(peer.tip?.cid, y3.cid);
 });
+
+test("a fork whose ancestors come before the first block's own still connects when they do", () => {
+  const { peer, sent, headers } = nexusFollower();
+  const g = nexusBlock(undefined, 0, HALF);
+  const a1 = nexusBlock(g.cid, 1, HALF);
+  const x = nexusBlock(a1.cid, 2, HALF, "x");
+  headers([x.entry]);
+  const base = JSON.parse(sent.at(-1)!.body);
+  const y = nexusBlock(a1.cid, 2, HALF, "y"),
+    y3 = nexusBlock(y.cid, 3, HALF, "y");
+  headers([y3.entry]);
+  const fork = JSON.parse(sent.at(-1)!.body);
+  assert.equal(fork.cid, y.cid);
+  headers([y.entry, a1.entry, g.entry], fork.requestID);
+  headers([a1.entry, g.entry], base.requestID);
+  assert.equal(peer.tip?.cid, y3.cid);
+});

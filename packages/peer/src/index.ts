@@ -121,6 +121,8 @@ export class ChainFollower {
   private readonly ancestorRequests = new Map<number, string>();
   /** The request for the first block's own ancestors, while open. */
   private baseRequest: number | undefined;
+  /** Ancestors answers that came before the first block's own. */
+  private early: { asked: string; entries: readonly Entry[] }[] = [];
   private heaviest: FollowedBlock | undefined;
   /** Capabilities the node's hello named. */
   capabilities: readonly string[] = [];
@@ -256,6 +258,12 @@ export class ChainFollower {
     if (requestID !== undefined && requestID === this.baseRequest) {
       this.baseRequest = undefined;
       this.extendDown(entries as Entry[]);
+      const early = this.early;
+      this.early = [];
+      for (const answer of early) {
+        for (const entry of [...answer.entries].reverse()) this.take(entry, true);
+        if (!this.blocks.has(answer.asked)) this.waiting.delete(answer.asked);
+      }
       return;
     }
     const asked = typeof requestID === "number" ? this.ancestorRequests.get(requestID) : undefined;
@@ -267,7 +275,15 @@ export class ChainFollower {
     // An ancestors answer runs child to parent: take parents first. Only a
     // branch that reaches a block this follower holds is taken.
     for (const entry of [...(entries as Entry[])].reverse()) this.take(entry, true);
-    if (!this.blocks.has(asked)) this.waiting.delete(asked);
+    if (this.blocks.has(asked)) return;
+    // A branch that did not connect is let go, unless the first block's own
+    // ancestors, which it may connect through, are still on their way: then
+    // its answer is taken again once they are in.
+    if (this.baseRequest !== undefined && this.early.length < 16) {
+      this.early.push({ asked, entries: entries as Entry[] });
+    } else {
+      this.waiting.delete(asked);
+    }
   }
 
   /**

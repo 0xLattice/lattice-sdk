@@ -29,7 +29,8 @@ The node it connects to picks where it starts: the first header the
 follower takes (the node's tip) and that block's 64 ancestors are the
 window every branch is weighed in. A branch that does not connect to a
 block in the window is dropped; the follower cannot reorg below it. The
-node also controls liveness: it can withhold what it has. So the tip it
-reports is the heaviest connected branch, above that start, among the
-headers that one node sent, each of which hashes to its CID and carries
+node also controls liveness: it can withhold what it has. As it holds more
+than `keep` blocks (4,096), the lightest are let go, which raises the
+window's floor. So the tip it reports is the heaviest branch connected
+within the window, among the headers that one node sent, each of which hashes to its CID and carries
 the work it claims.
