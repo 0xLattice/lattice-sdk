@@ -463,3 +463,119 @@ export class ChainFollower {
       this.blocks.delete(followed.cid);
   }
 }
+
+/** A peer's Ivy route: its public key (lower-case hex) and where it listens. */
+export interface PeerEndpoint {
+  readonly publicKey: string;
+  readonly host: string;
+  readonly port: number;
+}
+
+/**
+ * A provider found on the DHT and the web addresses its record carries.
+ * Without `via` it listens at `url`; with it, it is reached by connecting
+ * to peer `via` at `url` and relaying through that peer.
+ */
+export interface DiscoveredProvider extends PeerEndpoint {
+  readonly webAddresses: readonly { readonly url: string; readonly via?: string }[];
+}
+
+/** A dialed stream, and the host its peer was observed at. */
+export interface ChainHostTransport {
+  readonly observedHost: string;
+}
+
+/** What `connectToChainHost` uses of an Ivy node (Ivy's TypeScript shell). */
+export interface ChainHostIvy<T extends ChainHostTransport> {
+  readonly connectedPeers: readonly string[];
+  discoverProviders(
+    rootCID: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<readonly DiscoveredProvider[]>;
+  connect(endpoint: PeerEndpoint, over: T, options?: { signal?: AbortSignal }): Promise<void>;
+  setRelaying(peer: string, relays: boolean): void;
+  connectViaRelay(endpoint: PeerEndpoint, options?: { signal?: AbortSignal }): Promise<void>;
+}
+
+export interface ConnectToChainHostOptions<T extends ChainHostTransport> {
+  readonly ivy: ChainHostIvy<NoInfer<T>>;
+  /** Opens a stream to a `ws://` or `wss://` URL (Ivy's `connectWebSocket`). */
+  readonly connectWebSocket: (url: string) => Promise<T>;
+  readonly nexusGenesisCID: string;
+  readonly chainPath: readonly string[];
+  readonly signal?: AbortSignal;
+}
+
+/** The most streams `connectToChainHost` opens before giving up. */
+const MAX_DIALS = 8;
+
+/**
+ * The DHT key a chain's hosts provide under, or undefined for Nexus, which
+ * every node hosts.
+ */
+export function chainPeersKey(
+  nexusGenesisCID: string,
+  chainPath: readonly string[],
+): string | undefined {
+  if (chainPath.length <= 1) return undefined;
+  return `lattice.chain-peers.v1:${nexusGenesisCID}:${chainPath.join("/")}`;
+}
+
+/**
+ * Connects to a node hosting `chainPath` and returns its public key, or
+ * undefined if none was reached. Nexus: any connected peer (every node
+ * hosts it). A child: a provider already connected, else each provider's
+ * direct addresses, then its relayed ones, at most eight dials in all.
+ * The session's handshake proves the key, so an address claiming another
+ * node's key fails and the next is tried.
+ */
+export async function connectToChainHost<T extends ChainHostTransport>(
+  options: ConnectToChainHostOptions<T>,
+): Promise<string | undefined> {
+  const { ivy, connectWebSocket, signal } = options;
+  const request = signal ? { signal } : {};
+  const key = chainPeersKey(options.nexusGenesisCID, options.chainPath);
+  if (key === undefined) return ivy.connectedPeers[0];
+  const providers = await ivy.discoverProviders(key, request);
+  signal?.throwIfAborted();
+  const connected = providers.find((provider) => ivy.connectedPeers.includes(provider.publicKey));
+  if (connected) return connected.publicKey;
+
+  let dials = 0;
+  const dial = async (publicKey: string, url: string): Promise<boolean> => {
+    if (dials >= MAX_DIALS) return false;
+    dials += 1;
+    try {
+      const parsed = new URL(url);
+      const port = Number(parsed.port) || (parsed.protocol === "wss:" ? 443 : 80);
+      const transport = await connectWebSocket(url);
+      signal?.throwIfAborted();
+      await ivy.connect({ publicKey, host: transport.observedHost, port }, transport, request);
+      return true;
+    } catch {
+      signal?.throwIfAborted();
+      return false;
+    }
+  };
+
+  for (const provider of providers) {
+    const endpoint = { publicKey: provider.publicKey, host: provider.host, port: provider.port };
+    for (const address of provider.webAddresses) {
+      if (address.via === undefined && (await dial(provider.publicKey, address.url))) {
+        return provider.publicKey;
+      }
+    }
+    for (const { url, via } of provider.webAddresses) {
+      if (via === undefined) continue;
+      if (!ivy.connectedPeers.includes(via) && !(await dial(via, url))) continue;
+      ivy.setRelaying(via, true);
+      try {
+        await ivy.connectViaRelay(endpoint, request);
+        return provider.publicKey;
+      } catch {
+        signal?.throwIfAborted();
+      }
+    }
+  }
+  return undefined;
+}

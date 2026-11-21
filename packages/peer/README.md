@@ -34,3 +34,48 @@ than `keep` blocks (4,096), the lightest are let go, which raises the
 window's floor. So the tip it reports is the heaviest branch connected
 within the window, among the headers that one node sent, each of which hashes to its CID and carries
 the work it claims.
+
+## Finding a chain's hosts
+
+Every node hosts Nexus; a child chain's hosts provide under its DHT key,
+`chainPeersKey(nexusGenesisCID, chainPath)`. `connectToChainHost` finds one
+and connects to it: a provider already connected, else each provider's
+direct web addresses, then the ones it is relayed at. The session's
+handshake checks the key, so an address that claims another node's fails
+and the next is tried. It takes Ivy's `connectWebSocket` rather than
+depending on Ivy.
+
+A node drops a session that sends no chain hello within its timeout, so
+keep the entry session open by following Nexus on it while the lookup runs
+(every node hosts Nexus). Route each delivered message to the follower of
+the session it came from.
+
+```ts
+import { connectWebSocket } from "ivy"; // Ivy's TypeScript shell
+const followers = new Map<string, ChainFollower>(); // by session key
+const follow = (peer: string, chainPath: string[]) => {
+  const follower = new ChainFollower({
+    chainPath,
+    nexusGenesisCID,
+    send: (topic, payload) => ivy.sendMessage(peer, topic, payload),
+    onTip: (tip) => console.log(chainPath.join("/"), tip.block.height, tip.cid),
+  });
+  followers.set(peer, follower);
+  follower.open();
+};
+// In Ivy's delegate, keyed by hex (`from.key` is the key's bytes):
+// deliver(message, from) {
+//   const key = Array.from(from.key, (b) => b.toString(16).padStart(2, "0")).join("");
+//   followers.get(key)?.deliver(message.topic, message.payload) }
+
+await ivy.connect(entryEndpoint, await connectWebSocket("wss://node.example/ivy"));
+follow(entryEndpoint.publicKey, ["Nexus"]);
+const host = await connectToChainHost({
+  ivy,
+  connectWebSocket,
+  nexusGenesisCID,
+  chainPath: ["Nexus", "moniker"],
+});
+if (host === undefined) throw new Error("no host of Nexus/moniker reachable");
+follow(host, ["Nexus", "moniker"]);
+```
