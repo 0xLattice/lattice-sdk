@@ -34,3 +34,31 @@ than `keep` blocks (4,096), the lightest are let go, which raises the
 window's floor. So the tip it reports is the heaviest branch connected
 within the window, among the headers that one node sent, each of which hashes to its CID and carries
 the work it claims.
+
+## Finding a chain's hosts
+
+Every node hosts Nexus; a child chain's hosts provide under its DHT key,
+`chainPeersKey(nexusGenesisCID, chainPath)`. `connectToChainHost` finds one
+and connects to it: a provider already connected, else each provider's
+direct web addresses, then the ones it is relayed at. The session's
+handshake checks the key, so an address that claims another node's fails
+and the next is tried. It takes Ivy's `connectWebSocket` rather than
+depending on Ivy.
+
+```ts
+import { connectWebSocket } from "ivy"; // Ivy's TypeScript shell
+await ivy.connect(entryEndpoint, await connectWebSocket("wss://node.example/ivy"));
+const host = await connectToChainHost({
+  ivy,
+  connectWebSocket,
+  nexusGenesisCID,
+  chainPath: ["Nexus", "moniker"],
+});
+if (host === undefined) throw new Error("no host of Nexus/moniker reachable");
+const follower = new ChainFollower({
+  chainPath: ["Nexus", "moniker"],
+  nexusGenesisCID,
+  send: (topic, payload) => ivy.sendMessage(host, topic, payload),
+  onTip: (tip) => console.log(tip.block.height, tip.cid),
+});
+```
