@@ -45,9 +45,31 @@ handshake checks the key, so an address that claims another node's fails
 and the next is tried. It takes Ivy's `connectWebSocket` rather than
 depending on Ivy.
 
+A node drops a session that sends no chain hello within its timeout, so
+keep the entry session open by following Nexus on it while the lookup runs
+(every node hosts Nexus). Route each delivered message to the follower of
+the session it came from.
+
 ```ts
 import { connectWebSocket } from "ivy"; // Ivy's TypeScript shell
+const followers = new Map<string, ChainFollower>(); // by session key
+const follow = (peer: string, chainPath: string[]) => {
+  const follower = new ChainFollower({
+    chainPath,
+    nexusGenesisCID,
+    send: (topic, payload) => ivy.sendMessage(peer, topic, payload),
+    onTip: (tip) => console.log(chainPath.join("/"), tip.block.height, tip.cid),
+  });
+  followers.set(peer, follower);
+  follower.open();
+};
+// In Ivy's delegate, keyed by hex (`from.key` is the key's bytes):
+// deliver(message, from) {
+//   const key = Array.from(from.key, (b) => b.toString(16).padStart(2, "0")).join("");
+//   followers.get(key)?.deliver(message.topic, message.payload) }
+
 await ivy.connect(entryEndpoint, await connectWebSocket("wss://node.example/ivy"));
+follow(entryEndpoint.publicKey, ["Nexus"]);
 const host = await connectToChainHost({
   ivy,
   connectWebSocket,
@@ -55,10 +77,5 @@ const host = await connectToChainHost({
   chainPath: ["Nexus", "moniker"],
 });
 if (host === undefined) throw new Error("no host of Nexus/moniker reachable");
-const follower = new ChainFollower({
-  chainPath: ["Nexus", "moniker"],
-  nexusGenesisCID,
-  send: (topic, payload) => ivy.sendMessage(host, topic, payload),
-  onTip: (tip) => console.log(tip.block.height, tip.cid),
-});
+follow(host, ["Nexus", "moniker"]);
 ```
