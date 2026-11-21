@@ -22,4 +22,8 @@ const follower = new ChainFollower({
 ```
 
 The assurance is work, not validity: the follower does not execute blocks
-or check a block's target against its chain's schedule.
+or check a block's target against its chain's schedule, so a miner may pick
+an easy target and a header can cost little. Work is counted from the first
+block the follower takes (the node's tip when it starts): branches are
+weighed against each other only from there, and a branch that does not
+connect to a block it holds within 64 ancestors is dropped.

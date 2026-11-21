@@ -144,10 +144,17 @@ export function decodeLatticeBlock(bytes: Uint8Array): CanonicalBlock | undefine
     const value = decodeDagCbor(bytes) as { readonly [key: string]: DagCborValue };
     if (Object.keys(value).some((key) => !blockFields.has(key))) return undefined;
     if (blockLinks.some((key) => value[key] !== undefined && !isLink(value[key]))) return undefined;
+    // A target in the one spelling Lattice encodes (`toPrefixedHexString`),
+    // so one grind cannot name many blocks by respelling a target.
+    if (!isPrefixedHex(value.target) || !isPrefixedHex(value.nextTarget)) return undefined;
     return decodeCanonicalBlock(bytes);
   } catch {
     return undefined;
   }
+}
+
+function isPrefixedHex(value: DagCborValue | undefined): boolean {
+  return typeof value === "string" && /^0x(0|[1-9a-f][0-9a-f]{0,63})$/.test(value);
 }
 
 function hasWellFormedRewardRecipient(block: CanonicalBlock): boolean {

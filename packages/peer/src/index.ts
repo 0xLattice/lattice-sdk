@@ -92,6 +92,16 @@ export interface ChainFollowerOptions {
  * The assurance is work, not validity: it does not execute blocks or check
  * a block's target against its chain's schedule.
  */
+interface Entry {
+  readonly block: string;
+  readonly proofs: readonly string[];
+}
+
+const isRecord = (value: unknown): value is { [key: string]: unknown } =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+const isStrings = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === "string");
+
 export class ChainFollower {
   readonly chainPath: readonly string[];
   private readonly path: string;
@@ -103,7 +113,9 @@ export class ChainFollower {
   private after = 0n;
   private readonly asked = new Set<string>();
   private readonly blocks = new Map<string, FollowedBlock>();
-  private readonly waiting = new Map<string, { block: string; proofs: string[] }[]>();
+  private readonly waiting = new Map<string, Entry[]>();
+  /** Open ancestors requests: their id, and the parent each asked for. */
+  private readonly ancestorRequests = new Map<number, string>();
   private heaviest: FollowedBlock | undefined;
   /** Capabilities the node's hello named. */
   capabilities: readonly string[] = [];
@@ -129,12 +141,15 @@ export class ChainFollower {
 
   /** Hand every message the session delivers here. */
   deliver(topic: string, payload: Uint8Array) {
-    let body: { [key: string]: unknown };
+    let body: unknown;
     try {
-      body = JSON.parse(this.decoder.decode(payload)) as { [key: string]: unknown };
+      body = JSON.parse(this.decoder.decode(payload));
     } catch {
       return;
     }
+    // A node's message is untrusted: one that is not the shape it should
+    // be is ignored, never thrown.
+    if (!isRecord(body) || !isStrings(body.chainPath)) return;
     switch (topic) {
       case Topic.hello:
         if (
@@ -143,13 +158,14 @@ export class ChainFollower {
         ) {
           throw new Error("the node is on another network");
         }
-        this.capabilities = Array.isArray(body.capabilities) ? (body.capabilities as string[]) : [];
+        this.capabilities = isStrings(body.capabilities) ? body.capabilities : [];
         this.askStream(this.capabilities.includes(STREAM_TAIL) ? TAIL : 0n);
         return;
       case Topic.streamRequest:
         // The node reads this peer's log too; it runs none, so it is empty.
+        if (!Number.isSafeInteger(body.requestID)) return;
         this.send(Topic.streamPage, {
-          chainPath: body.chainPath as string[],
+          chainPath: body.chainPath,
           entries: [],
           hasMore: false,
           logID: "",
@@ -157,10 +173,10 @@ export class ChainFollower {
         });
         return;
       case Topic.streamPage:
-        if ((body.chainPath as string[]).join("/") === this.path) this.page(body);
+        if (body.chainPath.join("/") === this.path) this.page(body);
         return;
       case Topic.headersResponse:
-        if ((body.chainPath as string[]).join("/") === this.path) this.headers(body);
+        if (body.chainPath.join("/") === this.path) this.headers(body);
         return;
     }
   }
@@ -180,8 +196,20 @@ export class ChainFollower {
   }
 
   private page(body: { [key: string]: unknown }) {
-    const entries = body.entries as { position: number; block: string }[];
-    if (body.requestID !== 0) this.logID = body.logID as string;
+    const entries = body.entries;
+    if (
+      !Array.isArray(entries) ||
+      typeof body.logID !== "string" ||
+      !entries.every(
+        (entry) =>
+          isRecord(entry) &&
+          typeof entry.block === "string" &&
+          Number.isSafeInteger(entry.position),
+      )
+    ) {
+      return;
+    }
+    if (body.requestID !== 0) this.logID = body.logID;
     if (body.logID !== this.logID) return;
     const last = entries.at(-1);
     if (last !== undefined) this.after = BigInt(last.position);
@@ -191,7 +219,7 @@ export class ChainFollower {
       this.askStream(this.after);
       return;
     }
-    const wanted = [...new Set(entries.map((entry) => entry.block))].filter(
+    const wanted = [...new Set(entries.map((entry) => entry.block as string))].filter(
       (cid) => !this.asked.has(cid) && !this.blocks.has(cid),
     );
     this.fetch(body.requestID === 0 ? wanted : wanted.slice(-1));
@@ -199,6 +227,8 @@ export class ChainFollower {
 
   private fetch(cids: readonly string[]) {
     if (cids.length === 0) return;
+    // What is asked is only a hint against asking twice: kept bounded.
+    if (this.asked.size > 4096) this.asked.clear();
     for (const cid of cids) this.asked.add(cid);
     this.send(Topic.dataRequest, {
       chainPath: this.chainPath,
@@ -208,12 +238,36 @@ export class ChainFollower {
   }
 
   private headers(body: { [key: string]: unknown }) {
-    const entries = body.entries as { block: string; proofs: string[] }[];
-    // An ancestors answer runs child to parent: take parents first.
-    for (const entry of [...entries].reverse()) this.take(entry);
+    const entries = body.entries;
+    if (
+      !Array.isArray(entries) ||
+      !entries.every(
+        (entry) => isRecord(entry) && typeof entry.block === "string" && isStrings(entry.proofs),
+      )
+    ) {
+      return;
+    }
+    const requestID = body.requestID;
+    const asked = typeof requestID === "number" ? this.ancestorRequests.get(requestID) : undefined;
+    if (asked === undefined) {
+      for (const entry of entries as Entry[]) this.take(entry, false);
+      return;
+    }
+    this.ancestorRequests.delete(requestID as number);
+    // An ancestors answer runs child to parent: take parents first. Only a
+    // branch that reaches a block this follower holds is taken.
+    for (const entry of [...(entries as Entry[])].reverse()) this.take(entry, true);
+    if (!this.blocks.has(asked)) this.waiting.delete(asked);
   }
 
-  private take(entry: { block: string; proofs: string[] }) {
+  /**
+   * Takes one header. Work is counted only along blocks that connect to
+   * ones this follower holds, so every branch is weighed from the same
+   * place: the first block it took. A block whose parent it does not hold
+   * waits while that parent's ancestors are fetched; an ancestor that
+   * does not connect either is dropped.
+   */
+  private take(entry: Entry, fromAncestors: boolean) {
     let bytes: Uint8Array;
     try {
       bytes = base64(entry.block);
@@ -232,19 +286,27 @@ export class ChainFollower {
     if (parent !== undefined && parent.block.height + 1n !== block.height) {
       return this.options.onRejected?.(cid, "its height does not follow its parent's");
     }
-    if (parent === undefined && this.heaviest !== undefined && block.parentCID !== undefined) {
-      // A block on a branch this follower has not seen: it waits while its
-      // ancestors are fetched back to one the follower has.
-      const waiting = this.waiting.get(block.parentCID) ?? [];
-      if (waiting.length === 0) {
+    if (parent === undefined && this.heaviest !== undefined) {
+      if (fromAncestors || block.parentCID === undefined) return;
+      const waiting = this.waiting.get(block.parentCID);
+      if (waiting === undefined) {
+        // Branches whose ancestors never came are forgotten, not kept.
+        if (this.waiting.size >= 256) {
+          this.waiting.clear();
+          this.ancestorRequests.clear();
+        }
+        const requestID = this.nextRequestID++;
+        this.ancestorRequests.set(requestID, block.parentCID);
+        this.waiting.set(block.parentCID, [entry]);
         this.send(Topic.ancestorsRequest, {
           chainPath: this.chainPath,
           cid: block.parentCID,
           maximum: 64,
-          requestID: this.nextRequestID++,
+          requestID,
         });
+      } else if (waiting.length < 16) {
+        waiting.push(entry);
       }
-      if (this.waiting.size < 256) this.waiting.set(block.parentCID, [...waiting, entry]);
       return;
     }
     const followed: FollowedBlock = {
@@ -261,7 +323,7 @@ export class ChainFollower {
     }
     const children = this.waiting.get(cid);
     this.waiting.delete(cid);
-    for (const child of children ?? []) this.take(child);
+    for (const child of children ?? []) this.take(child, false);
   }
 
   /** The work `block`'s proof shows, or undefined when it shows none. */
@@ -282,7 +344,12 @@ export class ChainFollower {
         continue;
       }
       if (proof === undefined) continue;
-      const result = verifyChildBlockProof(proof, bytes, this.chainPath);
+      let result;
+      try {
+        result = verifyChildBlockProof(proof, bytes, this.chainPath);
+      } catch {
+        continue;
+      }
       if (
         result.ok &&
         result.evidence.work !== undefined &&
