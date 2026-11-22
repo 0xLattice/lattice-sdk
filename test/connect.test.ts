@@ -6,8 +6,10 @@ import {
   accountFromPrivateKey,
   bytesToHex,
   cidV1DagCbor,
+  decodeDagCbor,
   encodeDagCbor,
   generatePrivateKey,
+  isStandardCID,
   type DagCborValue,
 } from "@adalin/lattice-core";
 import { encodeVolumeArchive } from "@adalin/lattice-volumes";
@@ -347,12 +349,10 @@ test("a write the chain refuses is rejected by the chain's rules", async () => {
 test("a file is pinned through the sponsor's storage and named by its root CID", async () => {
   let paid = false;
   const bytes = new TextEncoder().encode("hello, file");
-  const expectedRoot = (() => {
-    const chunk = cidV1DagCbor(encodeDagCbor({ bytes }));
-    return cidV1DagCbor(
-      encodeDagCbor({ chunks: [chunk], size: BigInt(bytes.length), type: "text/plain" }),
-    );
-  })();
+  // A file of at most 1 MiB is one block, as lattice-storage lays it out.
+  const expectedRoot = cidV1DagCbor(
+    encodeDagCbor({ bytes, size: BigInt(bytes.length), type: "text/plain" }),
+  );
   const status = () => ({
     root: expectedRoot,
     bytes: "300",
@@ -375,7 +375,7 @@ test("a file is pinned through the sponsor's storage and named by its root CID",
   assert.equal(root, expectedRoot);
   const upload = requests.find((r) => r.path === "/store")!.body;
   assert.equal(upload.root, expectedRoot);
-  assert.equal(upload.volumes.length, 2);
+  assert.equal(upload.volumes.length, 1);
   // Work priced on the connected chain, for the upload.
   assert.deepEqual(
     requests.filter((r) => r.path === "/work").map((r) => [r.body.chain, r.body.store]),
@@ -714,4 +714,203 @@ test("an unsponsored write pays the node's fee floor as it is at the time", asyn
     submitted.map((payload) => payload.transaction.body.accountActions[0].delta),
     ["-1", "-3"],
   );
+});
+
+/** A node that also serves `files`, Volumes of one block each, by CID. */
+function fileWorld(files: Map<string, Uint8Array>) {
+  const { fetch, requests } = world({
+    nodeRoute: ({ path }) => {
+      if (!path.startsWith("/volumes/")) return undefined;
+      const cid = decodeURIComponent(path.slice("/volumes/".length));
+      const bytes = files.get(cid);
+      if (bytes === undefined) return undefined;
+      return new Response(encodeVolumeArchive({ rootCID: cid, entries: [{ cid, bytes }] }), {
+        headers: { "Content-Type": "application/vnd.lattice.volume" },
+      });
+    },
+  });
+  return { fetch, requests };
+}
+
+/** Stores `value` as one block; its CID. */
+function stored(files: Map<string, Uint8Array>, value: DagCborValue) {
+  const bytes = encodeDagCbor(value);
+  const cid = cidV1DagCbor(bytes);
+  files.set(cid, bytes);
+  return cid;
+}
+
+test("a file put stored reads back whole, with its type", async () => {
+  // 2.5 MiB: two whole chunks and a part.
+  const data = new Uint8Array((5 << 20) / 2).map((_, i) => (i * 7) & 0xff);
+  const files = new Map<string, Uint8Array>();
+  const { fetch } = fileWorld(files);
+  let root = "";
+  const chain = await connect({
+    ...options(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/store") {
+        // The sponsor keeps what was uploaded, and the node serves it.
+        const upload = JSON.parse(String(init!.body));
+        root = upload.root;
+        for (const volume of upload.volumes) {
+          for (const [cid, base64] of Object.entries(volume.entries)) {
+            files.set(cid, new Uint8Array(Buffer.from(base64 as string, "base64")));
+          }
+        }
+        return json({ root, bytes: "0", needed: {}, credit: "0", stored: true });
+      }
+      return fetch(input, init);
+    }),
+  });
+  assert.equal(await chain.put(new Blob([data], { type: "image/png" })), root);
+  const file = await chain.getFile(root);
+  assert.equal(file.type, "image/png");
+  assert.deepEqual(new Uint8Array(await file.arrayBuffer()), data);
+});
+
+test("a small file stored as one block reads back", async () => {
+  const files = new Map<string, Uint8Array>();
+  const bytes = new TextEncoder().encode("hello");
+  const root = stored(files, { type: "text/plain", size: 5n, bytes });
+  const chain = await connect(options(fileWorld(files).fetch));
+  const file = await chain.getFile(root);
+  assert.equal(file.type, "text/plain");
+  assert.equal(await file.text(), "hello");
+});
+
+test("a file whose chunks do not add up to its size is refused", async () => {
+  const files = new Map<string, Uint8Array>();
+  const chunk = stored(files, { bytes: new Uint8Array(10) });
+  const short = stored(files, { type: "", size: 11n, chunks: [chunk] });
+  const missing = stored(files, { type: "", size: 10n, chunks: [] });
+  const extra = stored(files, { type: "", size: 10n, chunks: [chunk], name: "x" });
+  const chain = await connect(options(fileWorld(files).fetch));
+  await assert.rejects(chain.getFile(short), /chunk 0 .* is not 11 bytes/);
+  await assert.rejects(chain.getFile(missing), /chunks do not cover its size/);
+  await assert.rejects(chain.getFile(extra), /not \{ type, size, bytes \| chunks \}/);
+  // A block whose bytes are not its CID never reaches the reader.
+  files.set(chunk, encodeDagCbor({ bytes: new Uint8Array(10).fill(1) }));
+  const swapped = stored(files, { type: "", size: 10n, chunks: [chunk] });
+  await assert.rejects(chain.getFile(swapped));
+});
+
+test("a file over maxBytes is refused before any chunk is fetched", async () => {
+  const files = new Map<string, Uint8Array>();
+  const chunk = stored(files, { bytes: new Uint8Array(10) });
+  const root = stored(files, { type: "", size: 10n, chunks: [chunk] });
+  const { fetch, requests } = fileWorld(files);
+  const chain = await connect(options(fetch));
+  await assert.rejects(chain.getFile(root, { maxBytes: 9 }), RangeError);
+  assert.ok(!requests.some((r) => r.path === `/volumes/${chunk}`));
+  assert.equal((await chain.getFile(root, { maxBytes: 10 })).size, 10);
+});
+
+test("a file read stops when its signal aborts", async () => {
+  const files = new Map<string, Uint8Array>();
+  const root = stored(files, { type: "", size: 1n, bytes: new Uint8Array(1) });
+  const chain = await connect(options(fileWorld(files).fetch));
+  const stop = new AbortController();
+  stop.abort(new Error("stopped"));
+  await assert.rejects(chain.getFile(root, { signal: stop.signal }), /stopped/);
+});
+
+/**
+ * lattice-storage's reader (0xLattice/lattice-storage `client/file.mjs` at
+ * fc24f13): `readRoot` over `readBlock`, ported line for line. A root it
+ * takes, or undefined.
+ */
+function storageReadRoot(volume: { cid: string; entries: Record<string, string> }) {
+  const CHUNK_BYTES = 1 << 20;
+  const encoded = volume?.entries?.[volume.cid];
+  if (typeof encoded !== "string") return undefined;
+  let root: any;
+  try {
+    const bytes = new Uint8Array(Buffer.from(encoded, "base64"));
+    if (cidV1DagCbor(bytes) !== volume.cid) return undefined;
+    root = decodeDagCbor(bytes);
+    if (Buffer.compare(encodeDagCbor(root), bytes) !== 0) return undefined;
+  } catch {
+    return undefined;
+  }
+  if (typeof root !== "object" || root === null || Object.keys(root).length !== 3) return undefined;
+  const { type, size, bytes, chunks } = root;
+  if (typeof type !== "string" || type.length > 255 || typeof size !== "bigint") return undefined;
+  if (bytes instanceof Uint8Array) {
+    return BigInt(bytes.length) === size && size <= BigInt(CHUNK_BYTES) ? root : undefined;
+  }
+  const count = (size + BigInt(CHUNK_BYTES) - 1n) / BigInt(CHUNK_BYTES);
+  if (!Array.isArray(chunks) || size <= BigInt(CHUNK_BYTES)) return undefined;
+  if (
+    BigInt(chunks.length) !== count ||
+    !chunks.every(
+      (cid) => typeof cid === "string" && /^b[a-z2-7]+$/.test(cid) && isStandardCID(cid),
+    )
+  ) {
+    return undefined;
+  }
+  return root;
+}
+
+test("files put stores are roots lattice-storage's reader takes, small and large", async () => {
+  for (const length of [0, 11, 1 << 20, (1 << 20) + 1]) {
+    let upload: any;
+    const { fetch } = world({
+      sponsorRoute: ({ path, body }) => {
+        if (path !== "/store") return undefined;
+        upload = body;
+        return json({ root: body.root, bytes: "0", needed: {}, credit: "0", stored: true });
+      },
+    });
+    const chain = await connect(options(fetch));
+    await chain.put(new Uint8Array(length), { type: "text/plain" });
+    const root = storageReadRoot(upload.volumes[0]);
+    assert.ok(root, `a ${length}-byte file's root`);
+    assert.equal(root.size, BigInt(length));
+    assert.equal(upload.volumes.length, length <= 1 << 20 ? 1 : 3);
+  }
+});
+
+test("a small file stored chunked, as earlier versions of put did, still reads", async () => {
+  const files = new Map<string, Uint8Array>();
+  const bytes = new TextEncoder().encode("hello, file");
+  const chunk = stored(files, { bytes });
+  const root = stored(files, { chunks: [chunk], size: BigInt(bytes.length), type: "text/plain" });
+  const chain = await connect(options(fileWorld(files).fetch));
+  assert.equal(await (await chain.getFile(root)).text(), "hello, file");
+});
+
+test("a file's Volumes are held near 1 MiB as they arrive, whatever maxBytes says", async () => {
+  const files = new Map<string, Uint8Array>();
+  // A root of 2 MiB: no file Volume is that large.
+  const big = stored(files, { type: "", size: 2n << 20n, bytes: new Uint8Array(2 << 20) });
+  // A one-block root just over 1 MiB, within the bound: lattice-storage's rule refuses it.
+  const over = stored(files, {
+    type: "",
+    size: BigInt((1 << 20) + 1),
+    bytes: new Uint8Array((1 << 20) + 1),
+  });
+  const chain = await connect(options(fileWorld(files).fetch));
+  await assert.rejects(chain.getFile(big, { maxBytes: 4 << 20 }), /too large/);
+  await assert.rejects(chain.getFile(over, { maxBytes: 4 << 20 }), /at most 1 MiB/);
+});
+
+test("a chunk that fails stops the other chunks being fetched", async () => {
+  const files = new Map<string, Uint8Array>();
+  const missing = cidV1DagCbor(encodeDagCbor({ bytes: new Uint8Array(1 << 20) }));
+  const hung = stored(files, { bytes: new Uint8Array(1) });
+  const root = stored(files, { type: "", size: BigInt((1 << 20) + 1), chunks: [missing, hung] });
+  const { fetch } = fileWorld(files);
+  let hungSignal: AbortSignal | undefined;
+  const chain = await connect(
+    options((input: string | URL, init?: RequestInit) => {
+      if (new URL(String(input)).pathname !== `/volumes/${hung}`) return fetch(input, init);
+      hungSignal = init!.signal!;
+      return new Promise<Response>((_, reject) =>
+        hungSignal!.addEventListener("abort", () => reject(hungSignal!.reason), { once: true }),
+      );
+    }),
+  );
+  await assert.rejects(chain.getFile(root));
+  assert.equal(hungSignal?.aborted, true);
 });

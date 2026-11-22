@@ -79,7 +79,22 @@ fee. Save this as an `.html` file and open it:
   states the value it replaces, as the chain requires. Writes and uploads
   from one `connect` run one at a time, so each takes the next nonce.
 - `await chain.put(bytes | blob)` pins a file for good through a sponsor's
-  storage (`--sell-storage`) and resolves to its root CID.
+  storage (`--sell-storage`) and resolves to its root CID. Files are laid out
+  as [lattice-storage](https://github.com/0xLattice/lattice-storage) reads
+  them: one block `{ type, size, bytes }` up to 1 MiB, else a root naming
+  1 MiB chunks; `type` is at most 255 characters. Version 0.2.0 chunked
+  small files too, so a small file stored now has a different root CID
+  than the same file stored by it; both read with `getFile`.
+- `await chain.getFile(root, { maxBytes })` reads that file back from the
+  node as a `Blob` with the type it was stored with. The root and every
+  1 MiB chunk are checked against their CIDs, their place and their length,
+  so a holder can fail to serve a file but cannot serve other bytes. A file
+  over `maxBytes` (default 64 MiB) is refused before any chunk is fetched,
+  and no one Volume of it is taken past 1 MiB and its encoding as it
+  arrives. A chunk that fails stops the others.
+  For a file over 1 MiB, the CID alone fetched from `/volumes` is only its
+  root listing the chunks. Small files stored chunked by earlier versions
+  still read.
 - `sponsors` are tried in order. A sponsor's `429` or `503` is retried after
   its `Retry-After` (up to 30 s; a longer one moves on to the next sponsor),
   or with backoff from 1 s, five attempts in all. Work it no longer takes
@@ -101,8 +116,8 @@ fee. Save this as an `.html` file and open it:
     keep the origin free of third-party script, or pass your own `key`.
   - `maxFee` (default `10`): the most an unsponsored write pays.
   - `confirmTimeoutMilliseconds` (default 15 minutes).
-  - `signal`: an `AbortSignal` that stops every call; `get`, `list`, `set`
-    and `put` also take `{ signal }`.
+  - `signal`: an `AbortSignal` that stops every call; `get`, `list`, `set`,
+    `put` and `getFile` also take `{ signal }`.
   - `workers`: Web Workers to grind in; by default all cores but one, `0`
     for the page's own thread.
   - `onProgress`: hears `work` (with `hashes`, `shares` and
