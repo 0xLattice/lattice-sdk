@@ -37,6 +37,6 @@
     "node": ">=22"
   },
   "scripts": {
-    "build:browser": "esbuild dist/index.js --bundle --format=esm --target=es2022 --outfile=dist/browser.js"
+    "build:browser": "esbuild dist/index.js --bundle --format=esm --target=es2022 --outfile=dist/browser.js \"--banner:js=/*! @adalin/lattice-sdk | MIT License | Copyright (c) 2026 The Lattice Authors | Includes @noble/hashes and @noble/ed25519, MIT License, Copyright (c) Paul Miller */\""
   }
 }
