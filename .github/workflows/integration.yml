@@ -38,7 +38,7 @@ jobs:
       # lattice-sponsor from its pinned image, run beside the node as a binary.
       - name: The pinned lattice-sponsor
         run: |
-          docker create --name sponsor ghcr.io/0xlattice/lattice-sponsor:sha-24d8c4d
+          docker create --name sponsor ghcr.io/0xlattice/lattice-sponsor:sha-fd74ac2
           docker cp sponsor:/usr/local/bin/lattice-sponsor "$RUNNER_TEMP/lattice-sponsor"
           docker rm sponsor
       - name: Exercise reads, relay policy, mining, inclusion, and paying a sponsor in work

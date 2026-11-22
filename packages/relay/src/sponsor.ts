@@ -52,13 +52,24 @@ export class SponsorError extends Error {
   readonly status: number;
   /** The sponsor's refusal, such as `insufficientCredit` or `expired`. */
   readonly refusal?: string;
+  /** How long the answer's `Retry-After` asks to wait, in milliseconds. */
+  readonly retryAfterMilliseconds?: number;
 
-  constructor(status: number, refusal?: string) {
+  constructor(status: number, refusal?: string, retryAfterMilliseconds?: number) {
     super(refusal ?? `sponsor request failed with HTTP ${status}`);
     this.name = "SponsorError";
     this.status = status;
     if (refusal !== undefined) this.refusal = refusal;
+    if (retryAfterMilliseconds !== undefined) this.retryAfterMilliseconds = retryAfterMilliseconds;
   }
+}
+
+/** A `Retry-After` header (seconds, or an HTTP date) in milliseconds from now. */
+function retryAfter(header: string | null): number | undefined {
+  if (header === null) return undefined;
+  if (/^[0-9]+$/.test(header.trim())) return Number(header.trim()) * 1000;
+  const date = Date.parse(header);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
 }
 
 export interface SponsorClientOptions {
@@ -133,13 +144,18 @@ export class SponsorClient {
     });
     const text = await boundedText(response, this.#maximumResponseBytes);
     if (text === undefined) throw new SponsorError(response.status, "response too large");
+    const wait = response.ok ? undefined : retryAfter(response.headers.get("retry-after"));
     let decoded: unknown;
     try {
       decoded = JSON.parse(text);
     } catch {
-      throw new SponsorError(response.status, response.ok ? "invalid JSON response" : undefined);
+      throw new SponsorError(
+        response.status,
+        response.ok ? "invalid JSON response" : undefined,
+        wait,
+      );
     }
-    if (!response.ok) throw new SponsorError(response.status, errorMessage(decoded));
+    if (!response.ok) throw new SponsorError(response.status, errorMessage(decoded), wait);
     if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) {
       throw new SponsorError(response.status, "invalid sponsor response");
     }

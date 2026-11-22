@@ -1,6 +1,6 @@
 {
   "name": "@adalin/lattice-sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Developer SDK for the Lattice network",
   "license": "MIT",
@@ -18,18 +18,25 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./browser": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/browser.js"
     }
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@adalin/lattice-client": "0.1.0",
-    "@adalin/lattice-core": "0.1.0",
-    "@adalin/lattice-relay": "0.1.0",
-    "@adalin/lattice-volumes": "0.1.0"
+    "@adalin/lattice-client": "0.2.0",
+    "@adalin/lattice-core": "0.2.0",
+    "@adalin/lattice-relay": "0.2.0",
+    "@adalin/lattice-volumes": "0.2.0"
   },
   "engines": {
     "node": ">=22"
+  },
+  "scripts": {
+    "build:browser": "esbuild dist/index.js --bundle --format=esm --target=es2022 --outfile=dist/browser.js \"--banner:js=/*! @adalin/lattice-sdk | MIT License | Copyright (c) 2026 The Lattice Authors | Includes @noble/hashes and @noble/ed25519, MIT License, Copyright (c) Paul Miller */\""
   }
 }
