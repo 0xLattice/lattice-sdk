@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { TestContext } from "node:test";
 
 import {
   accountFromPrivateKey,
@@ -33,7 +34,7 @@ function chainContent() {
     children: [link("2", leaf("2", "b")), link("1", leaf("1", "a"))],
   });
   const general = put({
-    count: 6n,
+    count: 7n,
     children: [
       link("g", leaf("greeting", "hello")),
       link("p", posts),
@@ -41,6 +42,8 @@ function chainContent() {
       link("e", leaf("ex", "plain")),
       link("e\u0301", leaf("e\u0301", "accent")),
       link("👋🏽", leaf("👋🏽", "wave")),
+      // A node that is not a trie node: its children are not a list.
+      link("z", put({ prefix: "z", value: "x", children: "none" })),
     ],
   });
   const state = put({
@@ -218,7 +221,7 @@ test("reads come from the tip block the node names, checked by CID", async () =>
   ]);
   assert.deepEqual(await chain.list("post/", { limit: 1 }), [{ key: "post/1", value: "a" }]);
   await assert.rejects(chain.list("", { limit: 0 }), RangeError);
-  assert.deepEqual(await chain.list("zz"), []);
+  assert.deepEqual(await chain.list("qq"), []);
 });
 
 test("a sponsored write states the value it replaces and resolves once in a block", async () => {
@@ -555,4 +558,160 @@ test("an unsponsored write refuses a fee above maxFee", async () => {
     return true;
   });
   assert.equal(submitted.length, 0);
+});
+
+test("a sponsor that always forgets the client token is given up on, not tried forever", async () => {
+  const { fetch, requests, submitted } = world({
+    sponsorRoute: ({ path, body }) =>
+      (path === "/work" && body.client !== undefined) || path === "/sponsor"
+        ? json({ error: { message: 'draft("unknown client token")' } }, 400)
+        : undefined,
+  });
+  const chain = await connect(options(fetch));
+  await assert.rejects(chain.set("greeting", "hi"), (error: unknown) => {
+    assert.ok(error instanceof WriteError);
+    assert.equal(error.code, "sponsorUnavailable");
+    assert.match(error.message, /unknown client token/);
+    return true;
+  });
+  // The co-signature was asked once, then again after each of three fresh starts.
+  assert.equal(requests.filter((r) => r.path === "/sponsor").length, 4);
+  assert.equal(submitted.length, 0);
+});
+
+test("a sponsor that forgot the token by the co-signature is paid again with a new one", async () => {
+  let forgot = false;
+  const { fetch, requests, submitted } = world({
+    sponsorRoute: ({ path }) => {
+      if (path !== "/sponsor" || forgot) return undefined;
+      forgot = true;
+      return json({ error: { message: 'draft("unknown client token")' } }, 400);
+    },
+  });
+  await (await connect(options(fetch))).set("greeting", "hi");
+  assert.equal(submitted.length, 1);
+  assert.deepEqual(
+    requests.filter((r) => r.path === "/work").map((r) => r.body.client !== undefined),
+    [false, false],
+  );
+});
+
+test("an upload paid for but never pinned stops after 60 polls", async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const status = {
+    root: "bafyroot",
+    bytes: "10",
+    needed: { "Nexus/app": "1" },
+    credit: "10",
+    stored: false,
+  };
+  const { fetch, requests } = world({
+    sponsorRoute: ({ path }) =>
+      path === "/store" || path.startsWith("/store/") ? json(status) : undefined,
+  });
+  const chain = await connect(options(fetch));
+  let outcome: unknown;
+  const putting = chain.put(new Uint8Array([1, 2, 3])).then(
+    () => (outcome = "pinned"),
+    (error: unknown) => (outcome = error),
+  );
+  for (let tick = 0; tick < 500 && outcome === undefined; tick++) {
+    await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(2_000);
+  }
+  assert.ok(outcome !== undefined, "the wait for the pin ended");
+  await putting;
+  assert.ok(outcome instanceof WriteError);
+  assert.equal(outcome.code, "sponsorUnavailable");
+  assert.match(outcome.message, /did not pin/);
+  assert.equal(requests.filter((r) => r.path.startsWith("/store/")).length, 60);
+});
+
+test("an error in the page's own code is not reported as an unavailable sponsor", async () => {
+  const bug = new TypeError("progress display broke");
+  const chain = await connect({
+    ...options(world().fetch),
+    onProgress: (p) => {
+      if (p.stage === "work") throw bug;
+    },
+  });
+  await assert.rejects(chain.set("greeting", "hi"), (error: unknown) => error === bug);
+});
+
+test("list refuses a limit that is not a positive integer, and reads refuse what is not a trie node", async () => {
+  const chain = await connect(options(world().fetch));
+  for (const limit of [0, -1, 1.5, Number.NaN, Infinity]) {
+    await assert.rejects(chain.list("", { limit }), RangeError, `limit ${limit}`);
+  }
+  await assert.rejects(chain.get("z"), /is not a general-state trie node/);
+  await assert.rejects(chain.list("z"), /is not a general-state trie node/);
+});
+
+test("each chain keeps its own key by default", async () => {
+  const kept = new Map<string, string>();
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: {
+      getItem: (name: string) => kept.get(name) ?? null,
+      setItem: (name: string, value: string) => void kept.set(name, value),
+    },
+  });
+  try {
+    const { fetch } = world();
+    const app = await connect({ chain: "Nexus/app", node: NODE, fetch });
+    const other = await connect({ chain: "Nexus/other", node: NODE, fetch });
+    const appAgain = await connect({ chain: "Nexus/app", node: NODE, fetch });
+    assert.notEqual(app.address, other.address);
+    assert.equal(app.address, appAgain.address);
+    assert.deepEqual([...kept.keys()].sort(), [
+      "lattice-sdk/key/Nexus/app",
+      "lattice-sdk/key/Nexus/other",
+    ]);
+  } finally {
+    if (descriptor === undefined) delete (globalThis as { localStorage?: unknown }).localStorage;
+    else Object.defineProperty(globalThis, "localStorage", descriptor);
+  }
+});
+
+test("a write queued behind an aborted one still runs", async () => {
+  const { fetch, submitted } = world();
+  const chain = await connect(options(fetch));
+  const controller = new AbortController();
+  const first = chain.set("greeting", "one", { signal: controller.signal });
+  const second = chain.set("greeting", "two");
+  setTimeout(() => controller.abort(new Error("left the page")), 20);
+  await assert.rejects(first, /left the page/);
+  // The first was aborted while it waited for its block; the second still went out.
+  assert.deepEqual(await second, { transactionCID: "bafytx" });
+  assert.equal(submitted.at(-1).transaction.body.actions[0].newValue, "two");
+});
+
+test("an upload aborted while it waits its turn ends without sending anything", async () => {
+  const { fetch, requests } = world();
+  const chain = await connect(options(fetch));
+  const controller = new AbortController();
+  const writing = chain.set("greeting", "one");
+  const uploading = chain.put(new Uint8Array([1]), { signal: controller.signal });
+  controller.abort(new Error("cancelled"));
+  await assert.rejects(uploading, /cancelled/);
+  await writing;
+  assert.equal(requests.filter((r) => r.path === "/store").length, 0);
+});
+
+test("an unsponsored write pays the node's fee floor as it is at the time", async () => {
+  let floor = 1;
+  const { fetch, submitted } = world({
+    balance: 100n,
+    nodeRoute: ({ path }) =>
+      path === "/api/chain/info" ? json({ chain: CHAIN, minRelayFee: String(floor) }) : undefined,
+  });
+  const chain = await connect(options(fetch, []));
+  await chain.set("greeting", "one");
+  floor = 3;
+  await chain.set("greeting", "two");
+  assert.deepEqual(
+    submitted.map((payload) => payload.transaction.body.accountActions[0].delta),
+    ["-1", "-3"],
+  );
 });

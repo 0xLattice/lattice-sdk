@@ -384,8 +384,13 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
   const clients = new Map<SponsorClient, string>();
   /** Writes run one after another: each reads the nonce and values the last one left. */
   let writes: Promise<unknown> = Promise.resolve();
-  const oneAtATime = <T>(write: () => Promise<T>): Promise<T> => {
-    const next = writes.then(write, write);
+  const oneAtATime = <T>(signal: AbortSignal | undefined, write: () => Promise<T>): Promise<T> => {
+    // A write aborted while it waited its turn ends without running.
+    const turn = () => {
+      signal?.throwIfAborted();
+      return write();
+    };
+    const next = writes.then(turn, turn);
     writes = next.catch(() => {});
     return next;
   };
@@ -394,7 +399,8 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
     return signals.length < 2 ? signals[0] : AbortSignal.any(signals);
   };
 
-  const info = await node.chainInfo(options.signal);
+  // The node must host the chain.
+  await node.chainInfo(options.signal);
 
   async function state(signal?: AbortSignal) {
     const latest = await lattice.latestBlock(signal);
@@ -615,7 +621,8 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
     const byOwnBalance = sponsors.length === 0;
     let sent: { payload: Payload; transactionCID: string };
     if (byOwnBalance) {
-      const fee = info.minRelayFee ?? 1n;
+      // The node's fee floor as it is now: it is its policy, and may change.
+      const fee = (await node.chainInfo(signal)).minRelayFee ?? 1n;
       if (fee > maxFee) {
         throw new WriteError("refused", `the node's fee floor ${fee} is above maxFee ${maxFee}`);
       }
@@ -691,11 +698,13 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
     },
 
     set(key, value, { signal } = {}) {
-      return oneAtATime(() => set(key, value, signalFor(signal)));
+      const combined = signalFor(signal);
+      return oneAtATime(combined, () => set(key, value, combined));
     },
 
     put(data, { type, signal } = {}) {
-      return oneAtATime(() => put(data, type, signalFor(signal)));
+      const combined = signalFor(signal);
+      return oneAtATime(combined, () => put(data, type, combined));
     },
   };
 }

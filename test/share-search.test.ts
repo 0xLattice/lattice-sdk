@@ -162,3 +162,27 @@ test("a worker failing after it answered fails the search", async () => {
     },
   );
 });
+
+test("a range that expires far in the future waits without overflowing a timer", async () => {
+  const warnings: string[] = [];
+  const listen = (warning: Error) => warnings.push(warning.name);
+  process.on("warning", listen);
+  try {
+    await withWorkers(
+      (worker) => setTimeout(() => worker.onmessage({ data: { done: true } }), 20),
+      async () => {
+        for await (const _ of findShares(
+          { ...easyWork(), expiresAt: Date.now() + 2 ** 40 },
+          { workers: 1 },
+        ));
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(
+      warnings.filter((name) => name === "TimeoutOverflowWarning"),
+      [],
+    );
+  } finally {
+    process.off("warning", listen);
+  }
+});
