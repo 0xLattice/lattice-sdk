@@ -6,7 +6,10 @@ import type { SponsorWork } from "@adalin/lattice-relay";
  * (both hex), in nonce order. A plain SHA-256 that hashes the prefix's whole
  * blocks once and only the last one or two per nonce.
  *
- * It uses nothing outside its own body, since a Web Worker runs its source.
+ * It is its own SHA-256 for two reasons. A blob Web Worker runs this
+ * function's source, so it may use nothing outside its own body; and it is
+ * 2.3 to 3.4 times as fast as @noble/hashes' midstate `clone()` on a
+ * sponsor's 632-byte prefix (2.5 against 0.8 MH/s in Node).
  */
 export function searchShares(
   prefixHex: string,
@@ -193,8 +196,10 @@ export function defaultWorkers(): number {
 
 /**
  * The shares in `work`'s range as they are found: in Web Workers, each
- * searching its slice, or on this thread, yielding between steps. Stops at
- * the end of the range or when it expires; throws `signal`'s reason.
+ * searching its slice, or on this thread, yielding between steps. A worker
+ * that fails before it has answered at all (a page whose content policy
+ * refuses blob workers) leaves the search to this thread. Stops at the end
+ * of the range or when it expires; throws `signal`'s reason.
  */
 export async function* findShares(
   work: Work,
@@ -206,10 +211,12 @@ export async function* findShares(
     yield* searchHere(work, options);
     return;
   }
-  const { pool, events } = started;
+  const { pool, events, url } = started;
   const queue: bigint[] = [];
+  const yielded = new Set<bigint>();
   let finished = 0;
   let failure: unknown;
+  let fallBack = false;
   let wake: (() => void) | undefined;
   events.onShare = (share) => {
     queue.push(share);
@@ -220,8 +227,9 @@ export async function* findShares(
     finished += 1;
     wake?.();
   };
-  events.onError = (error) => {
-    failure = error;
+  events.onError = (error, answered) => {
+    if (answered) failure = error;
+    else fallBack = true;
     wake?.();
   };
   const abort = () => wake?.();
@@ -230,21 +238,29 @@ export async function* findShares(
     while (true) {
       options.signal?.throwIfAborted();
       if (failure !== undefined) throw failure;
+      if (fallBack) break;
       const share = queue.shift();
       if (share !== undefined) {
+        yielded.add(share);
         yield share;
         continue;
       }
       if (finished === pool.length || Date.now() >= work.expiresAt) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       await new Promise<void>((resolve) => {
         wake = resolve;
-        setTimeout(resolve, Math.max(0, work.expiresAt - Date.now()));
+        timer = setTimeout(resolve, Math.min(0x7fffffff, Math.max(0, work.expiresAt - Date.now())));
       });
+      clearTimeout(timer);
       wake = undefined;
     }
   } finally {
     options.signal?.removeEventListener("abort", abort);
     for (const worker of pool) worker.terminate();
+    URL.revokeObjectURL(url);
+  }
+  for await (const share of searchHere(work, options)) {
+    if (!yielded.has(share)) yield share;
   }
 }
 
@@ -252,14 +268,15 @@ interface WorkerEvents {
   onShare?: (share: bigint) => void;
   onHashes?: (hashes: number) => void;
   onDone?: () => void;
-  onError?: (error: unknown) => void;
+  /** `answered`: whether the failing worker had sent anything first. */
+  onError?: (error: unknown, answered: boolean) => void;
 }
 
 /** `count` workers over slices of the range, or undefined where none can start. */
 function startWorkers(
   work: Work,
   count: number,
-): { pool: Worker[]; events: WorkerEvents } | undefined {
+): { pool: Worker[]; events: WorkerEvents; url: string } | undefined {
   const events: WorkerEvents = {};
   const pool: Worker[] = [];
   let url: string;
@@ -276,14 +293,16 @@ function startWorkers(
       const start = work.startNonce + index * slice;
       if (start >= end) break;
       const worker = new Worker(url);
+      let answered = false;
       worker.onmessage = ({ data }: MessageEvent) => {
+        answered = true;
         if (data.share !== undefined) events.onShare?.(data.share as bigint);
         else if (data.hashes !== undefined) events.onHashes?.(data.hashes as number);
         else if (data.done) events.onDone?.();
       };
       worker.onerror = (event) => {
         event.preventDefault();
-        events.onError?.(new Error(`share search failed: ${event.message}`));
+        events.onError?.(new Error(`share search failed: ${event.message}`), answered);
       };
       worker.postMessage({
         prefixHex: work.prefixHex,
@@ -294,13 +313,12 @@ function startWorkers(
       pool.push(worker);
     }
   } catch {
-    // A page whose content policy refuses blob workers searches on its own thread.
+    // A page that refuses blob workers outright searches on its own thread.
     for (const worker of pool) worker.terminate();
-    return undefined;
-  } finally {
     URL.revokeObjectURL(url);
+    return undefined;
   }
-  return { pool, events };
+  return { pool, events, url };
 }
 
 async function* searchHere(work: Work, options: ShareSearchOptions): AsyncGenerator<bigint> {

@@ -10,7 +10,8 @@ import {
   type DagCborValue,
 } from "@adalin/lattice-core";
 import { encodeVolumeArchive } from "@adalin/lattice-volumes";
-import { connect, WriteError } from "@adalin/lattice-sdk";
+import { SponsorClient, SponsorError } from "@adalin/lattice-relay";
+import { connect, retryDelay, WriteError } from "@adalin/lattice-sdk";
 
 const CHAIN = ["Nexus", "app"];
 const NODE = "https://node.example.org";
@@ -32,8 +33,15 @@ function chainContent() {
     children: [link("2", leaf("2", "b")), link("1", leaf("1", "a"))],
   });
   const general = put({
-    count: 3n,
-    children: [link("g", leaf("greeting", "hello")), link("p", posts)],
+    count: 6n,
+    children: [
+      link("g", leaf("greeting", "hello")),
+      link("p", posts),
+      // Children are filed under a whole Character: one of several code points.
+      link("e", leaf("ex", "plain")),
+      link("e\u0301", leaf("e\u0301", "accent")),
+      link("👋🏽", leaf("👋🏽", "wave")),
+    ],
   });
   const state = put({
     accountState: { rawCID: "accounts" },
@@ -121,8 +129,15 @@ function world(
         });
       }
       if (path.startsWith("/api/state/account/")) {
-        if (options.balance === undefined) return json({ error: "not found" }, 404);
-        return json({ owner: path.split("/").pop(), balance: String(options.balance), nonce: "4" });
+        // The nonce moves on with each transaction sent.
+        if (options.balance === undefined && submitted.length === 0) {
+          return json({ error: "not found" }, 404);
+        }
+        return json({
+          owner: path.split("/").pop(),
+          balance: String(options.balance ?? 0n),
+          nonce: String((options.balance === undefined ? 0 : 4) + submitted.length),
+        });
       }
       if (path === "/transactions") {
         submitted.push(body);
@@ -191,7 +206,7 @@ const options = (fetch: any, sponsors = ["https://one.example.org"]) => ({
   fetch,
 });
 
-test("reads come from the tip's state, checked by CID", async () => {
+test("reads come from the tip block the node names, checked by CID", async () => {
   const chain = await connect(options(world().fetch));
   assert.equal(await chain.get("greeting"), "hello");
   assert.equal(await chain.get("post/1"), "a");
@@ -201,10 +216,8 @@ test("reads come from the tip's state, checked by CID", async () => {
     { key: "post/1", value: "a" },
     { key: "post/2", value: "b" },
   ]);
-  assert.deepEqual(await chain.list("", { limit: 2 }), [
-    { key: "greeting", value: "hello" },
-    { key: "post/1", value: "a" },
-  ]);
+  assert.deepEqual(await chain.list("post/", { limit: 1 }), [{ key: "post/1", value: "a" }]);
+  await assert.rejects(chain.list("", { limit: 0 }), RangeError);
   assert.deepEqual(await chain.list("zz"), []);
 });
 
@@ -382,7 +395,10 @@ test("without a key, the visitor's key is kept in localStorage", async () => {
     const first = await connect({ chain: CHAIN.join("/"), node: NODE, fetch });
     const second = await connect({ chain: CHAIN.join("/"), node: NODE, fetch });
     assert.equal(first.address, second.address);
-    assert.equal(kept.size, 1);
+    assert.deepEqual([...kept.keys()], ["lattice-sdk/key/Nexus/app"]);
+    const own = await connect({ chain: CHAIN.join("/"), node: NODE, fetch, storageKey: "mine" });
+    assert.notEqual(own.address, first.address);
+    assert.deepEqual([...kept.keys()].sort(), ["lattice-sdk/key/Nexus/app", "mine"]);
   } finally {
     if (descriptor === undefined) delete (globalThis as { localStorage?: unknown }).localStorage;
     else Object.defineProperty(globalThis, "localStorage", descriptor);
@@ -404,4 +420,139 @@ test("with no localStorage at all, a key is made for the session", async () => {
     if (descriptor === undefined) delete (globalThis as { localStorage?: unknown }).localStorage;
     else Object.defineProperty(globalThis, "localStorage", descriptor);
   }
+});
+
+test("a key is read whole Characters at a time, emoji and combining marks included", async () => {
+  const chain = await connect(options(world().fetch));
+  assert.equal(await chain.get("e\u0301"), "accent");
+  assert.equal(await chain.get("ex"), "plain");
+  assert.equal(await chain.get("👋🏽"), "wave");
+  assert.equal(await chain.get("👋"), undefined);
+});
+
+test("writes made together are sent one after another, each at the next nonce", async () => {
+  const { fetch, requests, submitted } = world();
+  const chain = await connect(options(fetch));
+  await Promise.all([chain.set("greeting", "one"), chain.set("greeting", "two")]);
+  assert.deepEqual(
+    submitted.map((payload) => [
+      payload.transaction.body.nonce,
+      payload.transaction.body.actions[0].newValue,
+    ]),
+    [
+      ["0", "one"],
+      ["1", "two"],
+    ],
+  );
+  // The second write's work began only after the first was sent.
+  const paths = requests.map((r) => r.path);
+  assert.ok(paths.lastIndexOf("/work") > paths.indexOf("/transactions"));
+});
+
+test("a sponsor that forgot the client token is asked for work again with none", async () => {
+  let restarted = false;
+  const { fetch, requests, submitted } = world({
+    sponsorRoute: ({ path, body }) =>
+      restarted && path === "/work" && body.client !== undefined
+        ? json({ error: { message: 'draft("unknown client token")' } }, 400)
+        : undefined,
+  });
+  const chain = await connect(options(fetch));
+  await chain.set("greeting", "one");
+  restarted = true;
+  await chain.set("greeting", "two");
+  assert.equal(submitted.length, 2);
+  assert.deepEqual(
+    requests.filter((r) => r.path === "/work").map((r) => r.body.client !== undefined),
+    [false, true, false],
+  );
+});
+
+test("a write never seen in a block fails as not confirmed", async () => {
+  const { fetch } = world({
+    nodeRoute: ({ path }) =>
+      path === "/api/transaction/bafytx"
+        ? json({
+            txCID: "bafytx",
+            nonce: "0",
+            signers: [],
+            chainPath: CHAIN,
+            accountActions: [],
+            depositActions: [],
+            receiptActions: [],
+            withdrawalActions: [],
+          })
+        : undefined,
+  });
+  const chain = await connect({ ...options(fetch), confirmTimeoutMilliseconds: 50 });
+  await assert.rejects(chain.set("greeting", "hi"), (error: unknown) => {
+    assert.ok(error instanceof WriteError);
+    assert.equal(error.code, "notConfirmed");
+    return true;
+  });
+});
+
+test("a write stops when its signal aborts", async () => {
+  const { fetch } = world();
+  const chain = await connect(options(fetch));
+  const controller = new AbortController();
+  const writing = chain.set("greeting", "hi", { signal: controller.signal });
+  setTimeout(() => controller.abort(new Error("left the page")), 20);
+  await assert.rejects(writing, /left the page/);
+});
+
+test("a Retry-After past 30 s counts the sponsor unavailable at once", async () => {
+  const { fetch, submitted, requests } = world({
+    sponsorRoute: ({ host }) =>
+      host === "one.example.org"
+        ? json({ error: { message: "busy" } }, 503, { "Retry-After": "99999999999" })
+        : undefined,
+  });
+  const chain = await connect(
+    options(fetch, ["https://one.example.org", "https://two.example.org"]),
+  );
+  const started = Date.now();
+  await chain.set("greeting", "hi");
+  assert.equal(submitted.length, 1);
+  assert.equal(requests.filter((r) => r.host === "one.example.org").length, 1);
+  assert.ok(Date.now() - started < 10_000);
+});
+
+test("a Retry-After date is honoured as the wait until it", async () => {
+  const at = new Date(Date.now() + 5_000).toUTCString();
+  const sponsor = new SponsorClient("https://one.example.org", {
+    fetch: async () => json({ error: { message: "busy" } }, 503, { "Retry-After": at }),
+  });
+  const error = await sponsor.requestWork().catch((caught: unknown) => caught);
+  assert.ok(error instanceof SponsorError);
+  const wait = retryDelay(error, 0)!;
+  assert.ok(wait > 3_000 && wait <= 5_000, `waits ${wait} ms`);
+});
+
+test("a sponsor whose float the node finds short gives way to the next", async () => {
+  let refusals = 0;
+  const { fetch, submitted } = world({
+    nodeRoute: ({ path }) =>
+      path === "/transactions" && refusals++ === 0
+        ? json({ error: { message: "insufficientFunds" } }, 400)
+        : undefined,
+  });
+  const chain = await connect(
+    options(fetch, ["https://one.example.org", "https://two.example.org"]),
+  );
+  await chain.set("greeting", "hi");
+  assert.equal(submitted.length, 1);
+  assert.equal(refusals, 2);
+});
+
+test("an unsponsored write refuses a fee above maxFee", async () => {
+  const { fetch, submitted } = world({ balance: 100n });
+  const chain = await connect({ ...options(fetch, []), maxFee: 0n });
+  await assert.rejects(chain.set("greeting", "hi"), (error: unknown) => {
+    assert.ok(error instanceof WriteError);
+    assert.equal(error.code, "refused");
+    assert.match(error.message, /above maxFee 0/);
+    return true;
+  });
+  assert.equal(submitted.length, 0);
 });

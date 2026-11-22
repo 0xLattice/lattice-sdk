@@ -52,7 +52,7 @@ fee. Save this as an `.html` file and open it:
   });
   const key = `guestbook/${chain.address}`;
 
-  // A read, checked by CID from the node's latest block down.
+  // A read at the node's tip block, checked by CID from that block down.
   status.textContent = (await chain.get(key)) ?? "You have not signed yet.";
 
   // A write: paid for in proof of work, resolved once it is in a block.
@@ -61,34 +61,52 @@ fee. Save this as an `.html` file and open it:
       await chain.set(key, document.querySelector("#message").value);
       status.textContent = `Signed: ${await chain.get(key)}`;
     } catch (error) {
-      status.textContent = error.message; // "insufficient balance", "rejected by the chain's rules", "sponsor unavailable"
+      status.textContent = error.message; // e.g. "insufficient balance", "sponsor unavailable"
     }
   };
 </script>
 ```
 
-- `await chain.get(key)` is the value at the node's latest block, or
+- `await chain.get(key)` is the value at the tip block the node names, or
   `undefined`. `await chain.list(prefix, { limit })` is `[{ key, value }]` in
-  key order (`limit` defaults to 100). Both read the block, its state and
-  every trie node by CID: the node names the block, and serves nothing else
-  unchecked.
+  key order (`limit` is a positive integer, 100 by default). Both check that
+  block, its state and every trie node against their CIDs, so the answer is
+  exactly that block's. **The node chooses the block**: reads are only as
+  honest as that choice, and a dishonest node can name a block of a chain it
+  made up. Use a node you trust, or compare tips across nodes.
 - `await chain.set(key, value)` writes a string value and resolves with
-  `{ transactionCID }` once the write is in a block of the node's chain. The
-  write states the value it replaces, as the chain requires.
+  `{ transactionCID }` once the node shows the write in a block. The write
+  states the value it replaces, as the chain requires. Writes and uploads
+  from one `connect` run one at a time, so each takes the next nonce.
 - `await chain.put(bytes | blob)` pins a file for good through a sponsor's
   storage (`--sell-storage`) and resolves to its root CID.
 - `sponsors` are tried in order. A sponsor's `429` or `503` is retried after
-  its `Retry-After`, or with backoff from 1 s; work it no longer takes
-  (`unknownAssignment`, `expired`) is replaced with new work. With no
-  `sponsors`, the key pays the node's fee floor from its own balance.
+  its `Retry-After` (up to 30 s; a longer one moves on to the next sponsor),
+  or with backoff from 1 s, five attempts in all. Work it no longer takes
+  (`unknownAssignment`, `expired`) is replaced with new work, and a sponsor
+  that forgot the client token (it restarted) is asked once more without
+  one. A sponsor that does not pay within eight rounds of work, or whose
+  float the node finds short, gives way to the next. With no `sponsors`,
+  the key pays the node's fee floor from its own balance, up to `maxFee`.
 - A failed write is a `WriteError` whose `code` is `insufficientBalance`
   (unsponsored and unfunded), `rejected` (the chain's rules refused it),
-  `sponsorUnavailable` (no sponsor could pay), or `refused` (the node's own
-  policy, such as its fee floor or public submit being off).
-- Options: `key` (a 32-byte private key, or its hex) to bring your own,
-  `workers` (Web Workers to grind in; default all cores but one, `0` for the
-  page's own thread), and `onProgress`, which hears `work` (with `hashes`,
-  `shares` and `sharesNeeded`), `submit`, `confirm` and `store`.
+  `sponsorUnavailable` (no sponsor could pay), `refused` (the node's own
+  policy, such as its fee floor or public submit being off, or a fee above
+  `maxFee`), or `notConfirmed` (sent, but not in a block in time).
+- Options:
+  - `key`: a 32-byte private key, or its hex, to bring your own.
+  - `storageKey`: the `localStorage` name of the kept key, by default
+    `lattice-sdk/key/<chain>`. Any script running on the page's origin can
+    read it, so a cross-site scripting hole gives away the visitor's key:
+    keep the origin free of third-party script, or pass your own `key`.
+  - `maxFee` (default `10`): the most an unsponsored write pays.
+  - `confirmTimeoutMilliseconds` (default 15 minutes).
+  - `signal`: an `AbortSignal` that stops every call; `get`, `list`, `set`
+    and `put` also take `{ signal }`.
+  - `workers`: Web Workers to grind in; by default all cores but one, `0`
+    for the page's own thread.
+  - `onProgress`: hears `work` (with `hashes`, `shares` and
+    `sharesNeeded`), `submit`, `confirm` and `store`.
 
 The node must host the chain and accept writes on its public listener
 (`--public-submit`; `GET /api/chain/info` says `acceptsSubmit`).

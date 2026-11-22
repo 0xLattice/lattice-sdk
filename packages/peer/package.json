@@ -1,6 +1,6 @@
 {
   "name": "@adalin/lattice-peer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Follow a Lattice chain as an overlay peer, checking every header it is sent",
   "license": "MIT",

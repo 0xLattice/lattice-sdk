@@ -76,3 +76,89 @@ test("findShares stops at an expired range and reports its hashing", async () =>
   for await (const nonce of findShares({ ...work, expiresAt: Date.now() - 1 })) expired.push(nonce);
   assert.deepEqual(expired, []);
 });
+
+/**
+ * A stand-in for the browser's Worker: `behave` decides what each one does
+ * with the range it is sent, answering asynchronously as a worker does.
+ */
+function withWorkers(
+  behave: (worker: { onmessage?: any; onerror?: any }, range: any) => void,
+  run: () => Promise<void>,
+) {
+  const created: unknown[] = [];
+  class FakeWorker {
+    onmessage?: (event: { data: unknown }) => void;
+    onerror?: (event: { message: string; preventDefault(): void }) => void;
+    constructor(url: string) {
+      assert.match(url, /^blob:/);
+      created.push(this);
+    }
+    postMessage(range: unknown) {
+      setTimeout(() => behave(this, range), 1);
+    }
+    terminate() {}
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+  Object.defineProperty(globalThis, "Worker", { configurable: true, value: FakeWorker });
+  return run()
+    .then(() => created.length)
+    .finally(() => {
+      if (descriptor === undefined) delete (globalThis as { Worker?: unknown }).Worker;
+      else Object.defineProperty(globalThis, "Worker", descriptor);
+    });
+}
+
+const easyWork = () => ({
+  prefixHex: "00ff",
+  shareTarget: (1n << 252n) - 1n,
+  startNonce: 1000n,
+  count: 4000n,
+  expiresAt: Date.now() + 60_000,
+});
+const expectedShares = () =>
+  searchShares("00ff", ((1n << 252n) - 1n).toString(16).padStart(64, "0"), 1000n, 4000);
+
+test("workers each search their slice, and every share comes back", async () => {
+  const found: bigint[] = [];
+  const workers = await withWorkers(
+    (worker, { prefixHex, targetHex, start, end }) => {
+      for (const share of searchShares(prefixHex, targetHex, start, Number(end - start)))
+        worker.onmessage({ data: { share } });
+      worker.onmessage({ data: { hashes: Number(end - start) } });
+      worker.onmessage({ data: { done: true } });
+    },
+    async () => {
+      for await (const share of findShares(easyWork(), { workers: 3 })) found.push(share);
+    },
+  );
+  assert.equal(workers, 3);
+  assert.deepEqual(
+    found.sort((a, b) => (a < b ? -1 : 1)),
+    expectedShares(),
+  );
+});
+
+test("workers that fail before answering leave the search to this thread", async () => {
+  const found: bigint[] = [];
+  await withWorkers(
+    (worker) => worker.onerror({ message: "blocked by content policy", preventDefault() {} }),
+    async () => {
+      for await (const share of findShares(easyWork(), { workers: 2 })) found.push(share);
+    },
+  );
+  assert.deepEqual(found, expectedShares());
+});
+
+test("a worker failing after it answered fails the search", async () => {
+  await withWorkers(
+    (worker) => {
+      worker.onmessage({ data: { hashes: 1 } });
+      worker.onerror({ message: "out of memory", preventDefault() {} });
+    },
+    async () => {
+      await assert.rejects(async () => {
+        for await (const _ of findShares(easyWork(), { workers: 1 }));
+      }, /out of memory/);
+    },
+  );
+});
