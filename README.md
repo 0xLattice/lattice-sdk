@@ -9,6 +9,13 @@ Requires Node.js 22 or later. Packages provide ESM and TypeScript declarations; 
 npm install @adalin/lattice-sdk
 ```
 
+In a web page with no bundler, import it from a CDN:
+`import { connect } from "https://cdn.jsdelivr.net/npm/@adalin/lattice-sdk@0.2.0/dist/browser.js"`.
+`connect` reads and writes a chain with no coin and no wallet, paying fees in
+proof of work through a lattice-sponsor; see
+[packages/sdk](packages/sdk/README.md#in-a-web-page-with-no-coin-and-no-wallet)
+for a complete page.
+
 ### Low-level JSON transport
 
 `getJSON(url, options)` accepts an options object with `fetch`, `signal`,

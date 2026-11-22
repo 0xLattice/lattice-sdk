@@ -1,6 +1,6 @@
 {
   "name": "@adalin/lattice-volumes",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Verified complete-Volume transport boundary for Lattice content services and DHTs",
   "license": "MIT",
@@ -24,7 +24,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@adalin/lattice-core": "0.1.0"
+    "@adalin/lattice-core": "0.2.0"
   },
   "engines": {
     "node": ">=22"

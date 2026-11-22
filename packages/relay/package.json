@@ -1,6 +1,6 @@
 {
   "name": "@adalin/lattice-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Explicit relay and private-node transaction submission transports for Lattice",
   "license": "MIT",
@@ -24,7 +24,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@adalin/lattice-core": "0.1.0",
+    "@adalin/lattice-core": "0.2.0",
     "@noble/hashes": "^2.0.1"
   },
   "engines": {

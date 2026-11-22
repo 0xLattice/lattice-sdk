@@ -37,6 +37,7 @@ import {
   type SponsorWork,
 } from "@adalin/lattice-relay";
 import { HTTPVolumeTransport, VolumeClient } from "@adalin/lattice-volumes";
+import { connect } from "@adalin/lattice-sdk";
 
 const bin = process.env.LATTICE_NODE_BIN;
 const sponsorBin = process.env.LATTICE_SPONSOR_BIN;
@@ -63,6 +64,7 @@ interface Node {
 let writer: Node;
 let reader: Node;
 let sponsor: SponsorClient;
+let sponsorURL: string;
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -116,6 +118,8 @@ async function startNode(name: string, peers: string[]): Promise<Node> {
     ...["--public-read-rate", "0"],
     ...["--public-read-expensive-rate", "0"],
     ...["--public-read-max-rate", "0"],
+    // A static page writes through the public listener.
+    ...["--public-submit", "--public-submit-rate", "0"],
   ]);
   const operator = `http://127.0.0.1:${rpc}`;
   await until(async () => (await fetch(`${operator}/health`)).ok || undefined, `${name} health`);
@@ -250,7 +254,8 @@ before(async () => {
     ...["--sell-storage", "--storage-rate", "Nexus=1000000"],
     ...["--storage-file", join(directory, "sponsor-storage.json")],
   ]);
-  sponsor = new SponsorClient(`http://127.0.0.1:${port}`);
+  sponsorURL = `http://127.0.0.1:${port}`;
+  sponsor = new SponsorClient(sponsorURL);
   reader = await startNode("reader", [`${writer.key}@127.0.0.1:${writer.overlay}`]);
 });
 
@@ -346,4 +351,36 @@ test("a coinless key stores a file and posts it, paying in work; another node re
   // Neither the record nor the file cost the user a coin.
   assert.equal(await balance(writer, user.address), 0n);
   assert.equal(await balance(reader, user.address), 0n);
+});
+
+test("connect: a coinless visitor writes, reads back and pins a file, all paid in work", async () => {
+  // Blocks keep coming while the visitor waits, as on a live chain.
+  let mining = true;
+  const miner = (async () => {
+    while (mining) await mineOnce().catch(() => {});
+  })();
+  try {
+    const visitor = generatePrivateKey();
+    const chain = await connect({
+      chain: "Nexus",
+      node: writer.publicReads,
+      sponsors: [sponsorURL],
+      key: visitor,
+    });
+    await chain.set(`note/${chain.address}`, "first");
+    assert.equal(await chain.get(`note/${chain.address}`), "first");
+    // A second write replaces the first, stating it.
+    await chain.set(`note/${chain.address}`, "second");
+    assert.deepEqual(await chain.list("note/"), [
+      { key: `note/${chain.address}`, value: "second" },
+    ]);
+    const bytes = randomBytes(4096);
+    const root = await chain.put(new Blob([bytes], { type: "application/octet-stream" }));
+    assert.equal(root, fileVolumes("application/octet-stream", bytes)[0]!.cid);
+    assert.ok((await sponsor.storeStatus(root)).stored);
+    assert.equal(await balance(writer, chain.address), 0n);
+  } finally {
+    mining = false;
+    await miner;
+  }
 });

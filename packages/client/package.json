@@ -1,6 +1,6 @@
 {
   "name": "@adalin/lattice-client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Read-only Lattice node client composed with verified Volume retrieval",
   "license": "MIT",
@@ -24,8 +24,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@adalin/lattice-core": "0.1.0",
-    "@adalin/lattice-volumes": "0.1.0"
+    "@adalin/lattice-core": "0.2.0",
+    "@adalin/lattice-volumes": "0.2.0"
   },
   "engines": {
     "node": ">=22"

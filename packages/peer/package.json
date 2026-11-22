@@ -24,7 +24,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@adalin/lattice-core": "0.1.0"
+    "@adalin/lattice-core": "0.2.0"
   },
   "engines": {
     "node": ">=22"
