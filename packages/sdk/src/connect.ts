@@ -23,7 +23,7 @@ import {
   type SponsorWork,
 } from "@adalin/lattice-relay";
 import { HTTPVolumeTransport, VolumeClient, type VerifiedVolume } from "@adalin/lattice-volumes";
-import { readFile } from "./file.js";
+import { FILE_VOLUME_LIMITS, readFile } from "./file.js";
 import { findShares } from "./share-search.js";
 
 type Fetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
@@ -382,6 +382,10 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
   const node = new NodeClient(options.node, chainPath, { fetch: fresh });
   const volumes = new VolumeClient(new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch }));
   const lattice = new LatticeClient(node, volumes);
+  const files = new VolumeClient(
+    new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch, limits: FILE_VOLUME_LIMITS }),
+    FILE_VOLUME_LIMITS,
+  );
   const submitter = new HTTPTransactionSubmitter(`${node.baseURL}/transactions`, { fetch });
   const sponsors = (options.sponsors ?? []).map((url) => new SponsorClient(url, { fetch }));
   const privateKey =
@@ -725,7 +729,7 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
       if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
         throw new RangeError("maxBytes must be a non-negative integer");
       }
-      return readFile(volumes, root, maxBytes, signalFor(signal));
+      return readFile(files, root, maxBytes, signalFor(signal));
     },
   };
 }

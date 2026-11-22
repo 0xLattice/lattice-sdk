@@ -1,5 +1,5 @@
 import { decodeDagCbor, isStandardCID, type DagCborValue } from "@adalin/lattice-core";
-import type { VolumeClient } from "@adalin/lattice-volumes";
+import type { VolumeClient, VolumeLimits } from "@adalin/lattice-volumes";
 
 /** A file's chunk size in lattice-storage's layout. */
 export const CHUNK_BYTES = 1 << 20;
@@ -7,6 +7,15 @@ export const CHUNK_BYTES = 1 << 20;
 const MAX_TYPE_LENGTH = 255;
 /** Chunks fetched at once. */
 const CHUNKS_IN_FLIGHT = 4;
+/**
+ * What one Volume of a file may hold: one block, a chunk or a root, of at
+ * most 1 MiB and its encoding. A client reading files holds its transport
+ * to this, so no Volume is buffered past it.
+ */
+export const FILE_VOLUME_LIMITS: VolumeLimits = {
+  maximumEntries: 1,
+  maximumBytes: CHUNK_BYTES + 4096,
+};
 
 type Fields = { readonly [key: string]: DagCborValue };
 
@@ -23,9 +32,10 @@ function exactly(value: DagCborValue, keys: readonly string[]): Fields | undefin
 /**
  * The file named by `root` in lattice-storage's layout: one block
  * `{ type, size, bytes }`, or a root `{ type, size, chunks }` naming one
- * `{ bytes }` Volume per 1 MiB chunk. The root is checked, and its size held
- * to `maxBytes`, before any chunk is fetched; every chunk is checked against
- * its CID, its place and its length.
+ * `{ bytes }` Volume per 1 MiB chunk. `volumes` must be held to
+ * `FILE_VOLUME_LIMITS`. The root is checked, and its size held to
+ * `maxBytes`, before any chunk is fetched; every chunk is checked against
+ * its CID, its place and its length. A chunk that fails stops the others.
  */
 export async function readFile(
   volumes: VolumeClient,
@@ -50,7 +60,9 @@ export async function readFile(
 
   if (fields.bytes !== undefined) {
     const { bytes } = fields;
-    if (!(bytes instanceof Uint8Array) || bytes.length !== length) return fail("size mismatch");
+    if (!(bytes instanceof Uint8Array) || bytes.length !== length || length > CHUNK_BYTES) {
+      return fail("a one-block file is its size, at most 1 MiB");
+    }
     return new Blob([new Uint8Array(bytes)], { type });
   }
 
@@ -63,9 +75,12 @@ export async function readFile(
     return fail("its chunks do not cover its size");
   }
   const bytes = new Uint8Array(length);
+  const stop = new AbortController();
+  const chunkSignal = signal === undefined ? stop.signal : AbortSignal.any([signal, stop.signal]);
   const read = async (index: number) => {
     const cid = chunks[index] as string;
-    const chunk = exactly(decodeDagCbor((await volumes.get(cid, signal)).rootBytes()), ["bytes"]);
+    const volume = await volumes.get(cid, chunkSignal);
+    const chunk = exactly(decodeDagCbor(volume.rootBytes()), ["bytes"]);
     const expected = Math.min(CHUNK_BYTES, length - index * CHUNK_BYTES);
     if (!(chunk?.bytes instanceof Uint8Array) || chunk.bytes.length !== expected) {
       return fail(`chunk ${index} (${cid}) is not ${expected} bytes`);
@@ -75,7 +90,12 @@ export async function readFile(
   for (let at = 0; at < chunks.length; at += CHUNKS_IN_FLIGHT) {
     const batch: Promise<void>[] = [];
     for (let index = at; index < Math.min(chunks.length, at + CHUNKS_IN_FLIGHT); index++) {
-      batch.push(read(index));
+      batch.push(
+        read(index).catch((error: unknown) => {
+          stop.abort(error);
+          throw error;
+        }),
+      );
     }
     await Promise.all(batch);
   }

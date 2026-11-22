@@ -879,3 +879,38 @@ test("a small file stored chunked, as earlier versions of put did, still reads",
   const chain = await connect(options(fileWorld(files).fetch));
   assert.equal(await (await chain.getFile(root)).text(), "hello, file");
 });
+
+test("a file's Volumes are held near 1 MiB as they arrive, whatever maxBytes says", async () => {
+  const files = new Map<string, Uint8Array>();
+  // A root of 2 MiB: no file Volume is that large.
+  const big = stored(files, { type: "", size: 2n << 20n, bytes: new Uint8Array(2 << 20) });
+  // A one-block root just over 1 MiB, within the bound: lattice-storage's rule refuses it.
+  const over = stored(files, {
+    type: "",
+    size: BigInt((1 << 20) + 1),
+    bytes: new Uint8Array((1 << 20) + 1),
+  });
+  const chain = await connect(options(fileWorld(files).fetch));
+  await assert.rejects(chain.getFile(big, { maxBytes: 4 << 20 }), /too large/);
+  await assert.rejects(chain.getFile(over, { maxBytes: 4 << 20 }), /at most 1 MiB/);
+});
+
+test("a chunk that fails stops the other chunks being fetched", async () => {
+  const files = new Map<string, Uint8Array>();
+  const missing = cidV1DagCbor(encodeDagCbor({ bytes: new Uint8Array(1 << 20) }));
+  const hung = stored(files, { bytes: new Uint8Array(1) });
+  const root = stored(files, { type: "", size: BigInt((1 << 20) + 1), chunks: [missing, hung] });
+  const { fetch } = fileWorld(files);
+  let hungSignal: AbortSignal | undefined;
+  const chain = await connect(
+    options((input: string | URL, init?: RequestInit) => {
+      if (new URL(String(input)).pathname !== `/volumes/${hung}`) return fetch(input, init);
+      hungSignal = init!.signal!;
+      return new Promise<Response>((_, reject) =>
+        hungSignal!.addEventListener("abort", () => reject(hungSignal!.reason), { once: true }),
+      );
+    }),
+  );
+  await assert.rejects(chain.getFile(root));
+  assert.equal(hungSignal?.aborted, true);
+});

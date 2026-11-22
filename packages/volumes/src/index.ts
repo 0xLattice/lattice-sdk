@@ -386,6 +386,12 @@ function contentBaseURL(input: string): URL {
   return url;
 }
 
+/** The largest archive of one Volume within `limits`: its entries, their CIDs and lengths. */
+function archiveBytes(limits: VolumeLimits): number {
+  const overhead = 2 + limits.maximumEntries * (2 + MAXIMUM_VOLUME_CID_BYTES + 4);
+  return Math.min(MAXIMUM_VOLUME_ARCHIVE_BYTES, overhead + limits.maximumBytes);
+}
+
 async function boundedBytes(response: Response, maximumBytes: number): Promise<Uint8Array> {
   const declared = response.headers.get("content-length");
   if (declared !== null) {
@@ -474,7 +480,8 @@ export class HTTPVolumeTransport implements ManyVolumeTransport {
         response.status,
       );
     }
-    const archive = await boundedBytes(response, MAXIMUM_VOLUME_ARCHIVE_BYTES);
+    // Held to this transport's limits before more is buffered.
+    const archive = await boundedBytes(response, archiveBytes(this.#limits));
     return decodeVolumeArchive(rootCID, archive, this.#limits);
   }
 
