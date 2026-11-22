@@ -1,4 +1,4 @@
-import { LatticeClient, NodeClient, NodeError } from "@adalin/lattice-client";
+import { NodeClient, NodeError } from "@adalin/lattice-client";
 import {
   accountFromPrivateKey,
   bytesToHex,
@@ -22,8 +22,16 @@ import {
   type StoreVolume,
   type SponsorWork,
 } from "@adalin/lattice-relay";
-import { HTTPVolumeTransport, VolumeClient, type VerifiedVolume } from "@adalin/lattice-volumes";
+import {
+  BatchingVolumeTransport,
+  HTTPVolumeTransport,
+  VolumeClient,
+  type VerifiedVolume,
+} from "@adalin/lattice-volumes";
 import { findShares } from "./share-search.js";
+import { tipChooser, type Source } from "./tip.js";
+
+export { ReadError, type ReadFailure } from "./tip.js";
 
 type Fetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 type Payload = ReturnType<typeof transactionPayload>;
@@ -46,10 +54,28 @@ export interface ConnectOptions {
   /** The chain's path, as `Nexus/testnet/rsvp`. */
   readonly chain: string;
   /**
-   * A node's public read URL; it must host the chain, and take writes
-   * (public submit). This node chooses the tip that reads are taken at.
+   * A node's public read URL, or several run by different operators. The
+   * first must host the chain and take writes (public submit); all are read
+   * from. With one, that node chooses the tip reads are taken at. With
+   * several, a tip is read only once two of them hold it, and the heaviest
+   * such tip is read.
    */
-  readonly node: string;
+  readonly node: string | readonly string[];
+  /**
+   * The CID of the chain's genesis block, as the app ships it. Every tip
+   * read is then walked back to it (or to `checkpoint`, or to a block an
+   * earlier read linked) and refused unless each block links to the one
+   * before by the header rules. Without it, the tip is not checked against
+   * any history.
+   */
+  readonly genesis?: string;
+  /**
+   * The CID of a later block of the chain the app ships, to walk back to
+   * instead of genesis; reads must descend from it.
+   */
+  readonly checkpoint?: string;
+  /** The most blocks one read walks back before failing `tooFar`. Default: 2,000. */
+  readonly maxHeaders?: number;
   /** lattice-sponsor URLs, tried in order, that pay fees for proof of work. */
   readonly sponsors?: readonly string[];
   /**
@@ -81,10 +107,13 @@ export interface Chain {
   /** The writer's address. */
   readonly address: string;
   /**
-   * The value under `key` at the tip the node names. The block, its state
+   * The value under `key` at the tip (see `connect`). The block, its state
    * and every trie node are checked against their CIDs, so the answer is
-   * that block's; but the node chooses the block, and a dishonest node can
-   * name a block of a chain it made up.
+   * that block's. The tip's history is checked only with `genesis` or
+   * `checkpoint`, and no browser check makes a block's state honest: on a
+   * chain whose blocks carry little work, any one node can make a block
+   * that links to real history and holds any state. Several nodes guard
+   * against that: one alone cannot get its block read.
    */
   get(key: string, options?: { readonly signal?: AbortSignal }): Promise<string | undefined>;
   /** The records whose keys start with `prefix`, in key order: at most `limit` (default 100). Read as `get` reads. */
@@ -354,20 +383,43 @@ function trie(volumes: VolumeClient, rootCID: string, signal?: AbortSignal) {
 }
 
 /**
- * A chain to read and write, as a static page can. Reads are taken at the
- * tip block the node names and checked by CID from that block down: they
- * are as honest as the node's choice of tip. Writes are signed by the
- * visitor's key and paid for in proof of work through a lattice-sponsor (or,
- * with no sponsors, from the key's own balance), one at a time.
+ * A chain to read and write, as a static page can. Reads are taken at a tip
+ * block and checked by CID from that block down. With `genesis` (or
+ * `checkpoint`) the tip must link back to it; with several nodes, two must
+ * hold the tip. Otherwise reads are as honest as the one node's choice of
+ * tip. Writes are signed by the visitor's key and paid for in proof of work
+ * through a lattice-sponsor (or, with no sponsors, from the key's own
+ * balance), one at a time.
  */
 export async function connect(options: ConnectOptions): Promise<Chain> {
   const chainPath = options.chain.split("/");
   const fetch: Fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
   // A writer needs the tip as it is now, not as a cache kept it.
   const fresh: Fetch = (input, init) => fetch(input, { ...init, cache: "no-store" });
-  const node = new NodeClient(options.node, chainPath, { fetch: fresh });
-  const volumes = new VolumeClient(new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch }));
-  const lattice = new LatticeClient(node, volumes);
+  const urls = typeof options.node === "string" ? [options.node] : options.node;
+  if (urls.length === 0) throw new RangeError("node must name at least one node");
+  const sources: Source[] = urls.map((url) => {
+    const node = new NodeClient(url, chainPath, { fetch: fresh });
+    const transport = new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch });
+    return {
+      node,
+      volumes: new VolumeClient(transport),
+      pages: new VolumeClient(new BatchingVolumeTransport(transport)),
+    };
+  });
+  const { node } = sources[0]!;
+  const maxHeaders = options.maxHeaders ?? 2_000;
+  if (!Number.isSafeInteger(maxHeaders) || maxHeaders < 1) {
+    throw new RangeError("maxHeaders must be a positive integer");
+  }
+  const root = options.checkpoint ?? options.genesis;
+  const chooseTip = tipChooser({
+    sources,
+    chainPath,
+    ...(root === undefined ? {} : { root }),
+    maxHeaders,
+    storageKey: `lattice-sdk/linked/${options.chain}/${root}`,
+  });
   const submitter = new HTTPTransactionSubmitter(`${node.baseURL}/transactions`, { fetch });
   const sponsors = (options.sponsors ?? []).map((url) => new SponsorClient(url, { fetch }));
   const privateKey =
@@ -403,9 +455,13 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
   await node.chainInfo(options.signal);
 
   async function state(signal?: AbortSignal) {
-    const latest = await lattice.latestBlock(signal);
-    const post = await volumes.get(latest.canonical.postStateCID, signal);
-    return trie(volumes, decodeCanonicalLatticeState(post.rootBytes()).generalStateCID, signal);
+    const tip = await chooseTip(signal);
+    const post = await tip.source.volumes.get(tip.block.postStateCID, signal);
+    return trie(
+      tip.source.volumes,
+      decodeCanonicalLatticeState(post.rootBytes()).generalStateCID,
+      signal,
+    );
   }
 
   async function nextNonce(signal?: AbortSignal): Promise<{ nonce: bigint; balance: bigint }> {
