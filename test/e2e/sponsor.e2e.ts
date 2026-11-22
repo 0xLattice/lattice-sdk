@@ -202,6 +202,7 @@ function fileVolumes(type: string, bytes: Uint8Array) {
     const cid = cidV1DagCbor(block);
     return { cid, entries: { [cid]: Buffer.from(block).toString("base64") } };
   };
+  if (bytes.length <= CHUNK_BYTES) return [volume({ bytes, size: BigInt(bytes.length), type })];
   const chunks = [];
   for (let at = 0; at < bytes.length; at += CHUNK_BYTES) {
     chunks.push(volume({ bytes: bytes.subarray(at, at + CHUNK_BYTES) }));
