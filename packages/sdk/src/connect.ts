@@ -236,23 +236,25 @@ const refusal = (error: unknown) => (error instanceof SponsorError ? error.refus
 /** The sponsor no longer knows the client token: it restarted, and its credit is gone. */
 const unknownClient = (error: unknown) => /unknown client token/.test(refusal(error) ?? "");
 
-/** A file as lattice-storage lays it out: a root naming 1 MiB chunks. Root first. */
+/**
+ * A file as lattice-storage lays it out, root first: one block
+ * `{ type, size, bytes }` up to 1 MiB, else a root `{ type, size, chunks }`
+ * naming one `{ bytes }` Volume per 1 MiB chunk.
+ */
 function fileVolumes(type: string, bytes: Uint8Array): StoreVolume[] {
+  if (type.length > 255) throw new RangeError("a file's type is at most 255 characters");
   const volume = (value: DagCborValue): StoreVolume => {
     const block = encodeDagCbor(value);
     const cid = cidV1DagCbor(block);
     return { cid, entries: { [cid]: base64(block) } };
   };
+  const size = BigInt(bytes.length);
+  if (bytes.length <= 1 << 20) return [volume({ bytes, size, type })];
   const chunks: StoreVolume[] = [];
   for (let at = 0; at < bytes.length; at += 1 << 20) {
     chunks.push(volume({ bytes: bytes.subarray(at, at + (1 << 20)) }));
   }
-  const root = volume({
-    chunks: chunks.map((chunk) => chunk.cid),
-    size: BigInt(bytes.length),
-    type,
-  });
-  return [root, ...chunks];
+  return [volume({ chunks: chunks.map((chunk) => chunk.cid), size, type }), ...chunks];
 }
 
 function base64(bytes: Uint8Array): string {

@@ -6,8 +6,10 @@ import {
   accountFromPrivateKey,
   bytesToHex,
   cidV1DagCbor,
+  decodeDagCbor,
   encodeDagCbor,
   generatePrivateKey,
+  isStandardCID,
   type DagCborValue,
 } from "@adalin/lattice-core";
 import { encodeVolumeArchive } from "@adalin/lattice-volumes";
@@ -347,12 +349,10 @@ test("a write the chain refuses is rejected by the chain's rules", async () => {
 test("a file is pinned through the sponsor's storage and named by its root CID", async () => {
   let paid = false;
   const bytes = new TextEncoder().encode("hello, file");
-  const expectedRoot = (() => {
-    const chunk = cidV1DagCbor(encodeDagCbor({ bytes }));
-    return cidV1DagCbor(
-      encodeDagCbor({ chunks: [chunk], size: BigInt(bytes.length), type: "text/plain" }),
-    );
-  })();
+  // A file of at most 1 MiB is one block, as lattice-storage lays it out.
+  const expectedRoot = cidV1DagCbor(
+    encodeDagCbor({ bytes, size: BigInt(bytes.length), type: "text/plain" }),
+  );
   const status = () => ({
     root: expectedRoot,
     bytes: "300",
@@ -375,7 +375,7 @@ test("a file is pinned through the sponsor's storage and named by its root CID",
   assert.equal(root, expectedRoot);
   const upload = requests.find((r) => r.path === "/store")!.body;
   assert.equal(upload.root, expectedRoot);
-  assert.equal(upload.volumes.length, 2);
+  assert.equal(upload.volumes.length, 1);
   // Work priced on the connected chain, for the upload.
   assert.deepEqual(
     requests.filter((r) => r.path === "/work").map((r) => [r.body.chain, r.body.store]),
@@ -813,4 +813,69 @@ test("a file read stops when its signal aborts", async () => {
   const stop = new AbortController();
   stop.abort(new Error("stopped"));
   await assert.rejects(chain.getFile(root, { signal: stop.signal }), /stopped/);
+});
+
+/**
+ * lattice-storage's reader (0xLattice/lattice-storage `client/file.mjs` at
+ * fc24f13): `readRoot` over `readBlock`, ported line for line. A root it
+ * takes, or undefined.
+ */
+function storageReadRoot(volume: { cid: string; entries: Record<string, string> }) {
+  const CHUNK_BYTES = 1 << 20;
+  const encoded = volume?.entries?.[volume.cid];
+  if (typeof encoded !== "string") return undefined;
+  let root: any;
+  try {
+    const bytes = new Uint8Array(Buffer.from(encoded, "base64"));
+    if (cidV1DagCbor(bytes) !== volume.cid) return undefined;
+    root = decodeDagCbor(bytes);
+    if (Buffer.compare(encodeDagCbor(root), bytes) !== 0) return undefined;
+  } catch {
+    return undefined;
+  }
+  if (typeof root !== "object" || root === null || Object.keys(root).length !== 3) return undefined;
+  const { type, size, bytes, chunks } = root;
+  if (typeof type !== "string" || type.length > 255 || typeof size !== "bigint") return undefined;
+  if (bytes instanceof Uint8Array) {
+    return BigInt(bytes.length) === size && size <= BigInt(CHUNK_BYTES) ? root : undefined;
+  }
+  const count = (size + BigInt(CHUNK_BYTES) - 1n) / BigInt(CHUNK_BYTES);
+  if (!Array.isArray(chunks) || size <= BigInt(CHUNK_BYTES)) return undefined;
+  if (
+    BigInt(chunks.length) !== count ||
+    !chunks.every(
+      (cid) => typeof cid === "string" && /^b[a-z2-7]+$/.test(cid) && isStandardCID(cid),
+    )
+  ) {
+    return undefined;
+  }
+  return root;
+}
+
+test("files put stores are roots lattice-storage's reader takes, small and large", async () => {
+  for (const length of [0, 11, 1 << 20, (1 << 20) + 1]) {
+    let upload: any;
+    const { fetch } = world({
+      sponsorRoute: ({ path, body }) => {
+        if (path !== "/store") return undefined;
+        upload = body;
+        return json({ root: body.root, bytes: "0", needed: {}, credit: "0", stored: true });
+      },
+    });
+    const chain = await connect(options(fetch));
+    await chain.put(new Uint8Array(length), { type: "text/plain" });
+    const root = storageReadRoot(upload.volumes[0]);
+    assert.ok(root, `a ${length}-byte file's root`);
+    assert.equal(root.size, BigInt(length));
+    assert.equal(upload.volumes.length, length <= 1 << 20 ? 1 : 3);
+  }
+});
+
+test("a small file stored chunked, as earlier versions of put did, still reads", async () => {
+  const files = new Map<string, Uint8Array>();
+  const bytes = new TextEncoder().encode("hello, file");
+  const chunk = stored(files, { bytes });
+  const root = stored(files, { chunks: [chunk], size: BigInt(bytes.length), type: "text/plain" });
+  const chain = await connect(options(fileWorld(files).fetch));
+  assert.equal(await (await chain.getFile(root)).text(), "hello, file");
 });

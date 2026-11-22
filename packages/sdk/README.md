@@ -79,14 +79,18 @@ fee. Save this as an `.html` file and open it:
   states the value it replaces, as the chain requires. Writes and uploads
   from one `connect` run one at a time, so each takes the next nonce.
 - `await chain.put(bytes | blob)` pins a file for good through a sponsor's
-  storage (`--sell-storage`) and resolves to its root CID.
+  storage (`--sell-storage`) and resolves to its root CID. Files are laid out
+  as [lattice-storage](https://github.com/0xLattice/lattice-storage) reads
+  them: one block `{ type, size, bytes }` up to 1 MiB, else a root naming
+  1 MiB chunks; `type` is at most 255 characters.
 - `await chain.getFile(root, { maxBytes })` reads that file back from the
   node as a `Blob` with the type it was stored with. The root and every
   1 MiB chunk are checked against their CIDs, their place and their length,
   so a holder can fail to serve a file but cannot serve other bytes. A file
   over `maxBytes` (default 64 MiB) is refused before any chunk is fetched.
-  The CID alone, fetched from `/volumes`, is only the file's small root
-  listing its chunks.
+  For a file over 1 MiB, the CID alone fetched from `/volumes` is only its
+  root listing the chunks. Small files stored chunked by earlier versions
+  still read.
 - `sponsors` are tried in order. A sponsor's `429` or `503` is retried after
   its `Retry-After` (up to 30 s; a longer one moves on to the next sponsor),
   or with backoff from 1 s, five attempts in all. Work it no longer takes
