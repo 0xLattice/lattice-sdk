@@ -28,6 +28,7 @@ import {
   VolumeClient,
   type VerifiedVolume,
 } from "@adalin/lattice-volumes";
+import { FILE_VOLUME_LIMITS, readFile } from "./file.js";
 import { findShares } from "./share-search.js";
 import { HEADER_VOLUME_BYTES, tipChooser, type Source } from "./tip.js";
 
@@ -142,6 +143,17 @@ export interface Chain {
     data: Uint8Array | Blob,
     options?: { readonly type?: string; readonly signal?: AbortSignal },
   ): Promise<string>;
+  /**
+   * The file `put` stored under `root`, read from the node's Volumes, with
+   * the type it was stored with. Its root and every chunk are checked
+   * against their CIDs, so a holder can fail to serve it but not serve
+   * other bytes. A file over `maxBytes` (default 64 MiB) is refused before
+   * any chunk is fetched.
+   */
+  getFile(
+    root: string,
+    options?: { readonly maxBytes?: number; readonly signal?: AbortSignal },
+  ): Promise<Blob>;
 }
 
 export type WriteFailure =
@@ -263,23 +275,25 @@ const refusal = (error: unknown) => (error instanceof SponsorError ? error.refus
 /** The sponsor no longer knows the client token: it restarted, and its credit is gone. */
 const unknownClient = (error: unknown) => /unknown client token/.test(refusal(error) ?? "");
 
-/** A file as lattice-storage lays it out: a root naming 1 MiB chunks. Root first. */
+/**
+ * A file as lattice-storage lays it out, root first: one block
+ * `{ type, size, bytes }` up to 1 MiB, else a root `{ type, size, chunks }`
+ * naming one `{ bytes }` Volume per 1 MiB chunk.
+ */
 function fileVolumes(type: string, bytes: Uint8Array): StoreVolume[] {
+  if (type.length > 255) throw new RangeError("a file's type is at most 255 characters");
   const volume = (value: DagCborValue): StoreVolume => {
     const block = encodeDagCbor(value);
     const cid = cidV1DagCbor(block);
     return { cid, entries: { [cid]: base64(block) } };
   };
+  const size = BigInt(bytes.length);
+  if (bytes.length <= 1 << 20) return [volume({ bytes, size, type })];
   const chunks: StoreVolume[] = [];
   for (let at = 0; at < bytes.length; at += 1 << 20) {
     chunks.push(volume({ bytes: bytes.subarray(at, at + (1 << 20)) }));
   }
-  const root = volume({
-    chunks: chunks.map((chunk) => chunk.cid),
-    size: BigInt(bytes.length),
-    type,
-  });
-  return [root, ...chunks];
+  return [volume({ chunks: chunks.map((chunk) => chunk.cid), size, type }), ...chunks];
 }
 
 function base64(bytes: Uint8Array): string {
@@ -429,6 +443,10 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
         maximumEntries: 64,
         maximumBytes: HEADER_VOLUME_BYTES,
       }),
+      files: new VolumeClient(
+        new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch, limits: FILE_VOLUME_LIMITS }),
+        FILE_VOLUME_LIMITS,
+      ),
     };
   });
   const { node } = sources[0]!;
@@ -799,6 +817,26 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
     put(data, { type, signal } = {}) {
       const combined = signalFor(signal);
       return oneAtATime(combined, () => put(data, type, combined));
+    },
+
+    async getFile(root, { maxBytes = 64 << 20, signal } = {}) {
+      if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+        throw new RangeError("maxBytes must be a non-negative integer");
+      }
+      const combined = signalFor(signal);
+      // Read from the nodes that hold the tip, each in turn until one serves it.
+      const { holders } = await chooseTip(combined);
+      let failure: unknown;
+      for (const holder of holders) {
+        try {
+          return await readFile(holder.files, root, maxBytes, combined);
+        } catch (error) {
+          if (error instanceof RangeError) throw error;
+          combined?.throwIfAborted();
+          failure = error;
+        }
+      }
+      throw failure;
     },
   };
 }

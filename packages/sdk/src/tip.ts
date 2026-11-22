@@ -48,6 +48,8 @@ export interface Source {
   readonly volumes: VolumeClient;
   /** Its Volumes for walks: each held to `HEADER_VOLUME_BYTES`, fetched in batches. */
   readonly headers: VolumeClient;
+  /** Its Volumes for files: each held to one block of 1 MiB. */
+  readonly files: VolumeClient;
 }
 
 /** The tip reads are taken at: its block, and the source that served it. */
