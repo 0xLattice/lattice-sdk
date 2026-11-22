@@ -478,14 +478,28 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
   // The node must host the chain.
   await node.chainInfo(options.signal);
 
-  async function state(signal?: AbortSignal) {
+  /**
+   * `read` of the general state at the tip, through each node that holds
+   * it in turn until one answers: one node down or slow (each request has
+   * its timeout) does not fail the read.
+   */
+  async function atTip<T>(
+    read: (reads: ReturnType<typeof trie>) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const tip = await chooseTip(signal);
-    const post = await tip.source.volumes.get(tip.block.postStateCID, signal);
-    return trie(
-      tip.source.volumes,
-      decodeCanonicalLatticeState(post.rootBytes()).generalStateCID,
-      signal,
-    );
+    let failure: unknown;
+    for (const { volumes } of tip.holders) {
+      try {
+        const post = await volumes.get(tip.block.postStateCID, signal);
+        const general = decodeCanonicalLatticeState(post.rootBytes()).generalStateCID;
+        return await read(trie(volumes, general, signal));
+      } catch (error) {
+        signal?.throwIfAborted();
+        failure = error;
+      }
+    }
+    throw failure;
   }
 
   async function nextNonce(signal?: AbortSignal): Promise<{ nonce: bigint; balance: bigint }> {
@@ -675,7 +689,7 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
 
   async function set(key: string, value: string, signal?: AbortSignal) {
     const [old, { nonce, balance }] = await Promise.all([
-      state(signal).then((reads) => reads.get(key)),
+      atTip((reads) => reads.get(key), signal),
       nextNonce(signal),
     ]);
     // The chain checks the value being replaced: a write states it.
@@ -767,14 +781,14 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
     address: account.address,
 
     async get(key, { signal } = {}) {
-      return (await state(signalFor(signal))).get(key);
+      return atTip((reads) => reads.get(key), signalFor(signal));
     },
 
     async list(prefix = "", { limit = 100, signal } = {}) {
       if (!Number.isSafeInteger(limit) || limit < 1) {
         throw new RangeError("limit must be a positive integer");
       }
-      return (await state(signalFor(signal))).list(prefix, limit);
+      return atTip((reads) => reads.list(prefix, limit), signalFor(signal));
     },
 
     set(key, value, { signal } = {}) {

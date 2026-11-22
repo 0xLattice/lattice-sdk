@@ -54,8 +54,12 @@ export interface Source {
 export interface Tip {
   readonly cid: string;
   readonly block: CanonicalBlock;
-  readonly source: Source;
+  /** The source whose Volumes linked it, first, then every other that holds it. */
+  readonly holders: readonly Source[];
 }
+
+/** Blocks remembered as linked, at most; the least recently used goes first. */
+const LINKED = 64;
 
 /** A block this page already linked to the trust root, and the work above the root through it. */
 interface Linked {
@@ -107,6 +111,14 @@ export function tipChooser(options: TipOptions) {
   const isNexus = chainPath.length === 1;
   /** Blocks linked to the root on this page, by CID: never persisted, so never planted. */
   const linked = new Map<string, Linked>();
+  const remember = (cid: string, entry: Linked) => {
+    linked.delete(cid);
+    linked.set(cid, entry);
+    for (const oldest of linked.keys()) {
+      if (linked.size <= LINKED) break;
+      linked.delete(oldest);
+    }
+  };
   let rootHeight: bigint | undefined;
 
   /** The block at `tip` and the work above the root through it; throws when they do not link. */
@@ -185,7 +197,10 @@ export function tipChooser(options: TipOptions) {
       }
       if (cid === root) return { block: first, work };
       const known = linked.get(cid);
-      if (known !== undefined) return { block: first, work: work + known.work };
+      if (known !== undefined) {
+        remember(cid, known);
+        return { block: first, work: work + known.work };
+      }
       if (block.height <= rootHeight || block.parentCID === undefined) {
         throw new ReadError("unanchored", `${cid} does not descend from ${root}`);
       }
@@ -217,14 +232,20 @@ export function tipChooser(options: TipOptions) {
   /** The block at `cid` and its weight, read through each of `holders` until one answers. */
   async function weigh(cid: string, holders: readonly Source[], signal?: AbortSignal) {
     let failure: unknown;
-    for (const source of holders) {
+    for (const [index, source] of holders.entries()) {
+      // The holder that answers is read from first, the rest after it.
+      const order = [source, ...holders.filter((_, other) => other !== index)];
       try {
-        if (root !== undefined) return { source, ...(await walk(source, cid, signal)) };
+        if (root !== undefined) return { holders: order, ...(await walk(source, cid, signal)) };
         const block = decodeCanonicalBlock((await source.volumes.get(cid, signal)).rootBytes());
-        return { source, block, work: block.height };
+        if (isNexus && block.height > 0n && !verifyNexusBlockProofOfWork(block)) {
+          throw new ReadError("unanchored", `${cid} does not meet its proof-of-work target`);
+        }
+        return { holders: order, block, work: block.height };
       } catch (error) {
-        // A tip that does not link fails alike through every holder.
-        if (error instanceof ReadError) throw error;
+        // A tip that does not link fails alike through every holder; one
+        // holder's unreachable, slow or oversized answers do not.
+        if (error instanceof ReadError && error.code === "unanchored") throw error;
         signal?.throwIfAborted();
         failure = error;
       }
@@ -280,7 +301,7 @@ export function tipChooser(options: TipOptions) {
         )
       );
     }
-    if (root !== undefined) linked.set(best.cid, { height: best.block.height, work: best.work });
+    if (root !== undefined) remember(best.cid, { height: best.block.height, work: best.work });
     return best;
   };
 }

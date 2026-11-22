@@ -357,3 +357,77 @@ test("on Nexus, every block walked must meet its proof-of-work target", async ()
   });
   await assert.rejects(app.get("greeting"), /proof-of-work/);
 });
+
+/** `fetch`, but node `host` answers `/volumes/<cid>` for which `bad(cid)` with `answer`. */
+function spoiled(
+  fetch: (input: string | URL) => Promise<Response>,
+  host: string,
+  bad: (cid: string) => boolean,
+  answer: (cid: string) => Response,
+) {
+  return (input: string | URL) => {
+    const url = new URL(String(input));
+    const cid = decodeURIComponent(url.pathname.slice("/volumes/".length));
+    return url.host.startsWith(`${host}.`) && url.pathname.startsWith("/volumes/") && bad(cid)
+      ? Promise.resolve(answer(cid))
+      : fetch(input);
+  };
+}
+
+test("a walk one node pads past its budget is read through another that holds the tip", async () => {
+  const { fetch } = nodes({ a: real, b: real });
+  const padded = (cid: string) => {
+    const bytes = content.get(cid)!;
+    const padding = encodeDagCbor({ padding: new Uint8Array(30_000) });
+    return new Response(
+      encodeVolumeArchive({
+        rootCID: cid,
+        entries: [
+          { cid, bytes },
+          { cid: cidV1DagCbor(padding), bytes: padding },
+        ].sort((x, y) => (x.cid < y.cid ? -1 : 1)),
+      }),
+      { headers: { "Content-Type": "application/vnd.lattice.volume" } },
+    );
+  };
+  const blocks = new Set(real.map((b) => b.cid));
+  const spoilt = spoiled(fetch, "a", (cid) => blocks.has(cid), padded);
+  // 50 blocks' budget is 200 KiB; a's 30 padded blocks are 900 KB.
+  const alone = await reader(spoilt, at("a"), { maxHeaders: 50 });
+  await assert.rejects(alone.get("greeting"), { name: "ReadError", code: "tooFar" });
+  const app = await reader(spoilt, [at("a"), at("b")], { maxHeaders: 50 });
+  assert.equal(await app.get("greeting"), "real/29");
+});
+
+test("a state read one node fails is read through another that holds the tip", async () => {
+  const { fetch } = nodes({ a: real, b: real });
+  const tip = real.at(-1)!;
+  const app = await reader(
+    spoiled(
+      fetch,
+      "a",
+      (cid) => cid === tip.postState,
+      () => new Response("down", { status: 503 }),
+    ),
+    [at("a"), at("b")],
+  );
+  assert.equal(await app.get("greeting"), "real/29");
+  assert.deepEqual(await app.list("greet"), [{ key: "greeting", value: "real/29" }]);
+});
+
+test("on Nexus with nothing pinned, the tip must still meet its proof-of-work target", async () => {
+  const nexus = chain(3, "nexus");
+  const { fetch } = nodes({ a: [...nexus, block(nexus.at(-1), "nexus/3", { target: "0x1" })] }, [
+    "Nexus",
+  ]);
+  const app = await connect({ chain: "Nexus", node: at("a"), fetch, key: "11".repeat(32) });
+  await assert.rejects(app.get("greeting"), /proof-of-work/);
+  const { fetch: fine } = nodes({ a: nexus }, ["Nexus"]);
+  const honest = await connect({
+    chain: "Nexus",
+    node: at("a"),
+    fetch: fine,
+    key: "11".repeat(32),
+  });
+  assert.equal(await honest.get("greeting"), "nexus/2");
+});

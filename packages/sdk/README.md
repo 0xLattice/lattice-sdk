@@ -45,8 +45,9 @@ fee. Save this as an `.html` file and open it:
     // A tip is read once two of these hold it. Give nodes of different
     // operators: these two testnet nodes share one.
     node: ["https://lattice-testnet-apps-iad.fly.dev", "https://ams.testnet.lattice.build"],
-    // A block of the chain this page ships (testnet 74,008), refreshed with
-    // each release (see below): reads must descend from it.
+    // A block of the chain this page ships (testnet 74,008): reads must
+    // descend from it. Stale once the chain is 2,000 blocks past it
+    // (maxHeaders); refresh it with each release (see below).
     checkpoint: "bafyreib2btiyscwrh5ccy2ufxf7fh57gk6hjhxovlxx3awk6ssxinzggbq",
     sponsors: ["https://lattice-testnet-apps-iad.fly.dev:8650/sponsor"],
     onProgress: (p) => {
@@ -110,7 +111,9 @@ fee. Save this as an `.html` file and open it:
     heaviest is read: the sum of `workForTarget` of each block's **stated**
     target above the pinned block (checked against proof of work only on
     Nexus), or the highest without a pin; equal ones by smaller CID. If a
-    node's Volumes fail, another that holds the tip is read from.
+    node's Volumes fail, time out (15 s a request) or overrun the walk's
+    bounds, the tip and its state are read through another node that holds
+    it. Without a pin, a Nexus tip must still meet its proof-of-work target.
   - **What that does not cover.** The SDK does not run the chain's rules,
     so it cannot tell a block's state was honestly reached: a block that
     links is not a block whose state is right. Targets are checked only
