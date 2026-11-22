@@ -12,8 +12,9 @@ import { type VerifiedVolume, VolumeClient } from "@adalin/lattice-volumes";
 /**
  * Why no tip was read: `unanchored`, a tip that does not link back to the
  * app's `genesis` (or `checkpoint`) by the header rules; `tooFar`, a tip
- * more than `maxHeaders` blocks past the newest block already linked;
- * `disagree`, several sources answered and no two of them hold one tip.
+ * more than `maxHeaders` blocks (or their byte budget) past the newest
+ * block already linked; `disagree`, fewer than `minAgree` sources hold any
+ * one tip.
  */
 export type ReadFailure = "unanchored" | "tooFar" | "disagree";
 
@@ -21,21 +22,32 @@ export class ReadError extends Error {
   readonly code: ReadFailure;
 
   constructor(code: ReadFailure, detail: string, cause?: unknown) {
-    super(
-      `${{ unanchored: "unanchored tip", tooFar: "tip too far", disagree: "sources disagree" }[code]}: ${detail}`,
-      { cause },
-    );
+    const plain = {
+      unanchored: "unanchored tip",
+      tooFar: "tip too far",
+      disagree: "sources disagree",
+    };
+    super(`${plain[code]}: ${detail}`, { cause });
     this.name = "ReadError";
     this.code = code;
   }
 }
 
-/** A node to read from: its JSON reads, its Volumes, and its Volumes in pages. */
+/** One block's Volume, at most, in a walk: a block and its children index. */
+export const HEADER_VOLUME_BYTES = 32 * 1024;
+/** What a walk may fetch, on average, per block it may walk. */
+export const HEADER_BUDGET_BYTES = 4 * 1024;
+/** Rows of one page of the chain fetched ahead of a walk. */
+const PAGE = 25;
+/** How far past this device's clock a block's timestamp may be (Bitcoin's 2 hours). */
+const FUTURE_MILLISECONDS = 2 * 60 * 60 * 1000;
+
+/** A node to read from. */
 export interface Source {
   readonly node: NodeClient;
   readonly volumes: VolumeClient;
-  /** The same Volumes, batched: for walks that fetch many blocks at once. */
-  readonly pages: VolumeClient;
+  /** Its Volumes for walks: each held to `HEADER_VOLUME_BYTES`, fetched in batches. */
+  readonly headers: VolumeClient;
 }
 
 /** The tip reads are taken at: its block, and the source that served it. */
@@ -45,25 +57,22 @@ export interface Tip {
   readonly source: Source;
 }
 
-/** A block already linked to the trust root: memoized, so a walk can stop at it. */
+/** A block this page already linked to the trust root, and the work above the root through it. */
 interface Linked {
-  readonly cid: string;
   readonly height: bigint;
-  /** Work of the blocks above the trust root, through this one. */
   readonly work: bigint;
 }
 
-/** Blocks remembered as linked, newest kept. */
-const KEPT = 16;
-
 export interface TipOptions {
+  /** Distinct nodes: two URLs of one operator still count as two. */
   readonly sources: readonly Source[];
   readonly chainPath: readonly string[];
   /** The block reads must descend from: the app's checkpoint, or its genesis. */
   readonly root?: string;
   readonly maxHeaders: number;
-  /** Where linked blocks are kept between visits; `localStorage` when it can. */
-  readonly storageKey: string;
+  /** Sources that must hold a tip before it is read. */
+  readonly minAgree: number;
+  readonly now?: () => number;
 }
 
 function decoded(volume: VerifiedVolume, cid: string): CanonicalBlock {
@@ -72,113 +81,111 @@ function decoded(volume: VerifiedVolume, cid: string): CanonicalBlock {
   return block;
 }
 
+const size = (volume: VerifiedVolume) =>
+  volume.entries().reduce((total, entry) => total + entry.bytes.length, 0);
+
 /**
  * Chooses the tip to read at, as the SDK's README states:
  *
- * - With a trust `root`, every tip is walked back block by block until it
- *   meets the root or a block already linked to it: each link is checked
- *   (parent CID, height, prevState = parent's postState, same spec, later
- *   timestamp, target no easier than the parent's nextTarget) and, on
- *   Nexus, each block's proof of work. A walk past `maxHeaders` fails
- *   `tooFar`.
- * - With more than one source answering, a tip counts only once a second
- *   source holds it on its own chain (names it, or has it at that height).
- *   Of the tips that count, the heaviest is read (most work above the root,
- *   or the highest without a root); equal ones break by smaller CID.
+ * - A tip is read only once `minAgree` sources hold it: name it as their
+ *   tip, or have it at its height on their chain.
+ * - With a trust `root`, a tip is walked back block by block until it meets
+ *   the root or a block this page already linked (kept in memory only):
+ *   each link is checked (parent CID, height, prevState = parent's
+ *   postState, same spec, later timestamp no more than 2 hours ahead of this
+ *   device, target no easier than the parent's nextTarget) and, on Nexus,
+ *   each block's proof of work. A walk past `maxHeaders` blocks, or
+ *   `maxHeaders × HEADER_BUDGET_BYTES` bytes, fails `tooFar`.
+ * - Of the tips that agree and link, the heaviest is read: the sum of
+ *   `workForTarget` of each block's stated target above the root (verified
+ *   proof of work only on Nexus), or the highest without a root; equal ones
+ *   break by smaller CID.
  */
 export function tipChooser(options: TipOptions) {
-  const { sources, chainPath, root, maxHeaders, storageKey } = options;
+  const { sources, chainPath, root, maxHeaders, minAgree } = options;
+  const now = options.now ?? Date.now;
   const isNexus = chainPath.length === 1;
-  let linked: Linked[] = load();
+  /** Blocks linked to the root on this page, by CID: never persisted, so never planted. */
+  const linked = new Map<string, Linked>();
   let rootHeight: bigint | undefined;
 
-  function load(): Linked[] {
-    try {
-      const kept = JSON.parse(globalThis.localStorage?.getItem(storageKey) ?? "[]") as unknown;
-      if (!Array.isArray(kept)) return [];
-      return kept.flatMap((entry: { cid?: unknown; height?: unknown; work?: unknown }) =>
-        typeof entry?.cid === "string" &&
-        typeof entry.height === "string" &&
-        typeof entry.work === "string" &&
-        /^\d+$/.test(entry.height) &&
-        /^\d+$/.test(entry.work)
-          ? [{ cid: entry.cid, height: BigInt(entry.height), work: BigInt(entry.work) }]
-          : [],
-      );
-    } catch {
-      return [];
-    }
-  }
-
-  function keep(entry: Linked) {
-    linked = [entry, ...linked.filter((known) => known.cid !== entry.cid)].slice(0, KEPT);
-    try {
-      globalThis.localStorage?.setItem(
-        storageKey,
-        JSON.stringify(
-          linked.map((known) => ({
-            cid: known.cid,
-            height: known.height.toString(),
-            work: known.work.toString(),
-          })),
-        ),
-      );
-    } catch {
-      // No storage: linked blocks are remembered for this page only.
-    }
-  }
-
-  /** The work above `root` of the blocks from `cid` down to it; throws when they do not link. */
-  async function walk(source: Source, cid: string, signal?: AbortSignal) {
+  /** The block at `tip` and the work above the root through it; throws when they do not link. */
+  async function walk(source: Source, tip: string, signal?: AbortSignal) {
     if (rootHeight === undefined) {
-      rootHeight = decoded(await source.volumes.get(root!, signal), root!).height;
+      rootHeight = decoded(await source.headers.get(root!, signal), root!).height;
     }
+    let budget = maxHeaders * HEADER_BUDGET_BYTES;
+    const spend = (volume: VerifiedVolume) => {
+      budget -= size(volume);
+      return volume;
+    };
     const fetched = new Map<string, Promise<VerifiedVolume>>();
-    /** Starts fetching the next page of the source's chain below `height`. */
+    /** The lowest height the last page listed; a page missed stops paging. */
+    let paged: bigint | undefined;
+    let paging = true;
+    /** Fetches the next page of the source's chain below `height`, while pages hit. */
     const prefetch = async (height: bigint) => {
-      const floor = linked.reduce(
-        (best, known) => (known.height < height && known.height > best ? known.height : best),
-        rootHeight!,
-      );
-      const limit = Number(height - floor < 25n ? height - floor : 25n);
+      let floor = rootHeight!;
+      for (const known of linked.values()) {
+        if (known.height < height && known.height > floor) floor = known.height;
+      }
+      const limit = Number(height - floor < BigInt(PAGE) ? height - floor : BigInt(PAGE));
       if (limit < 2) return;
       const page = await source.node.blocks({ before: height, limit }, signal);
+      paged = page.blocks.at(-1)?.height ?? height;
       for (const row of page.blocks) {
         if (fetched.has(row.hash)) continue;
-        const volume = source.pages.get(row.hash, signal);
+        const volume = source.headers.get(row.hash, signal).then(spend);
         volume.catch(() => {}); // A row off this walk's chain is never awaited.
         fetched.set(row.hash, volume);
       }
     };
 
+    let cid = tip;
     let child: { cid: string; block: CanonicalBlock } | undefined;
+    let first: CanonicalBlock | undefined;
     let work = 0n;
-    let tip: CanonicalBlock | undefined;
     for (let steps = 0; ; steps++) {
-      if (child !== undefined && !fetched.has(cid)) await prefetch(child.block.height);
-      const block = decoded(await (fetched.get(cid) ?? source.volumes.get(cid, signal)), cid);
-      tip ??= block;
+      if (child !== undefined && !fetched.has(cid) && paging) {
+        // A page that listed this height without this block was the
+        // source's chain, not this tip's: fetch one at a time from here.
+        if (paged !== undefined && child.block.height - 1n >= paged) paging = false;
+        else await prefetch(child.block.height);
+      }
+      const block = decoded(
+        await (fetched.get(cid) ?? source.headers.get(cid, signal).then(spend)),
+        cid,
+      );
+      if (budget < 0) {
+        throw new ReadError(
+          "tooFar",
+          `walking ${tip} took more than ${maxHeaders * HEADER_BUDGET_BYTES} bytes`,
+        );
+      }
+      first ??= block;
+      if (block.timestamp > BigInt(now() + FUTURE_MILLISECONDS)) {
+        throw new ReadError("unanchored", `${cid} is stamped more than 2 hours ahead`);
+      }
       if (child !== undefined) {
-        const parent = block;
         const next = child.block;
         try {
-          assertBlockContinuity(cid, parent, next);
+          assertBlockContinuity(cid, block, next);
         } catch (error) {
           throw new ReadError("unanchored", `${child.cid}: ${(error as Error).message}`, error);
         }
-        if (next.specCID !== parent.specCID) {
+        if (next.specCID !== block.specCID) {
           throw new ReadError("unanchored", `${child.cid} changes the chain's spec`);
         }
-        if (next.timestamp <= parent.timestamp) {
+        if (next.timestamp <= block.timestamp) {
           throw new ReadError("unanchored", `${child.cid} is not later than its parent`);
         }
-        if (BigInt(next.target) > BigInt(parent.nextTarget)) {
+        if (BigInt(next.target) > BigInt(block.nextTarget)) {
           throw new ReadError("unanchored", `${child.cid} has an easier target than scheduled`);
         }
       }
-      if (cid === root) return { block: tip, work };
-      const known = linked.find((entry) => entry.cid === cid);
-      if (known !== undefined) return { block: tip, work: work + known.work };
+      if (cid === root) return { block: first, work };
+      const known = linked.get(cid);
+      if (known !== undefined) return { block: first, work: work + known.work };
       if (block.height <= rootHeight || block.parentCID === undefined) {
         throw new ReadError("unanchored", `${cid} does not descend from ${root}`);
       }
@@ -188,7 +195,7 @@ export function tipChooser(options: TipOptions) {
       if (steps >= maxHeaders) {
         throw new ReadError(
           "tooFar",
-          `more than ${maxHeaders} blocks from the newest block linked to ${root}; pin a newer checkpoint, or raise maxHeaders`,
+          `more than ${maxHeaders} blocks from ${root}; ship a newer checkpoint, or raise maxHeaders`,
         );
       }
       work += workForTarget(block.target);
@@ -201,70 +208,79 @@ export function tipChooser(options: TipOptions) {
   async function holds(source: Source, cid: string, height: bigint, signal?: AbortSignal) {
     try {
       return (await source.node.block(height, signal)).hash === cid;
-    } catch (error) {
+    } catch {
       signal?.throwIfAborted();
       return false;
     }
+  }
+
+  /** The block at `cid` and its weight, read through each of `holders` until one answers. */
+  async function weigh(cid: string, holders: readonly Source[], signal?: AbortSignal) {
+    let failure: unknown;
+    for (const source of holders) {
+      try {
+        if (root !== undefined) return { source, ...(await walk(source, cid, signal)) };
+        const block = decodeCanonicalBlock((await source.volumes.get(cid, signal)).rootBytes());
+        return { source, block, work: block.height };
+      } catch (error) {
+        // A tip that does not link fails alike through every holder.
+        if (error instanceof ReadError) throw error;
+        signal?.throwIfAborted();
+        failure = error;
+      }
+    }
+    throw failure;
   }
 
   return async function choose(signal?: AbortSignal): Promise<Tip> {
     const answers = await Promise.allSettled(
       sources.map((source) => source.node.latestBlock(signal)),
     );
-    const named = new Map<string, { height: bigint; by: Source[] }>();
-    answers.forEach((answer, index) => {
-      if (answer.status !== "fulfilled") return;
-      const entry = named.get(answer.value.hash) ?? { height: answer.value.height, by: [] };
-      entry.by.push(sources[index]!);
-      named.set(answer.value.hash, entry);
-    });
+    signal?.throwIfAborted();
     const answered = sources.filter((_, index) => answers[index]!.status === "fulfilled");
     if (answered.length === 0) throw (answers[0] as PromiseRejectedResult).reason;
+    const named = new Map<string, { height: bigint; holders: Source[] }>();
+    answers.forEach((answer, index) => {
+      if (answer.status !== "fulfilled") return;
+      const entry = named.get(answer.value.hash) ?? { height: answer.value.height, holders: [] };
+      entry.holders.push(sources[index]!);
+      named.set(answer.value.hash, entry);
+    });
 
-    let best: (Tip & { weight: bigint }) | undefined;
-    let refused: unknown;
-    for (const [cid, { height, by }] of named) {
-      if (answered.length > 1 && by.length < 2) {
-        let seconded = false;
-        for (const other of answered) {
-          if (!by.includes(other) && (await holds(other, cid, height, signal))) {
-            seconded = true;
-            break;
-          }
+    let best: (Tip & { work: bigint }) | undefined;
+    let failure: unknown;
+    for (const [cid, { height, holders }] of named) {
+      for (const other of answered) {
+        if (holders.length >= minAgree) break;
+        if (!holders.includes(other) && (await holds(other, cid, height, signal))) {
+          holders.push(other);
         }
-        if (!seconded) continue;
       }
-      const source = by[0]!;
-      let block: CanonicalBlock;
-      let weight: bigint;
+      if (holders.length < minAgree) continue;
       try {
-        if (root === undefined) {
-          block = decodeCanonicalBlock((await source.volumes.get(cid, signal)).rootBytes());
-          weight = block.height;
-        } else {
-          ({ block, work: weight } = await walk(source, cid, signal));
+        const weighed = await weigh(cid, holders, signal);
+        if (
+          best === undefined ||
+          weighed.work > best.work ||
+          (weighed.work === best.work && cid < best.cid)
+        ) {
+          best = { cid, ...weighed };
         }
       } catch (error) {
-        if (!(error instanceof ReadError) || answered.length === 1) throw error;
-        refused = error;
-        continue;
-      }
-      if (
-        best === undefined ||
-        weight > best.weight ||
-        (weight === best.weight && cid < best.cid)
-      ) {
-        best = { cid, block, source, weight };
+        signal?.throwIfAborted();
+        failure = error;
       }
     }
     if (best === undefined) {
-      if (refused !== undefined) throw refused;
-      throw new ReadError(
-        "disagree",
-        `${answered.length} sources answered and no two of them hold the same tip`,
+      throw (
+        failure ??
+        new ReadError(
+          "disagree",
+          `${answered.length} of ${sources.length} sources answered and no tip is held by ${minAgree}`,
+        )
       );
     }
-    if (root !== undefined) keep({ cid: best.cid, height: best.block.height, work: best.weight });
+    if (root !== undefined) linked.set(best.cid, { height: best.block.height, work: best.work });
     return best;
   };
 }

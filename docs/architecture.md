@@ -55,7 +55,7 @@ and exposes explicit parent/state continuity verification.
 Generic CID verification alone does not establish that a block won fork
 choice. `connect` walks a tip back to an app-pinned genesis or checkpoint by
 the header rules (with proof of work on Nexus) and, given several nodes,
-reads only a tip two of them hold; it does not execute blocks, and child-chain
+reads only a tip `minAgree` (default two) of them hold; it does not execute blocks, and child-chain
 work (carried in `ChildBlockProof`s) is not served over HTTP, so a child
 chain's tip is as honest as the nodes that agree on it.
 

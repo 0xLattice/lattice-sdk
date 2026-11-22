@@ -40,10 +40,10 @@ function state(greeting: string) {
 function block(
   parent: Block | undefined,
   greeting: string,
-  changes: { prevState?: string; spec?: string; target?: string } = {},
+  changes: { prevState?: string; spec?: string; target?: string; timestamp?: bigint } = {},
 ): Block {
   const height = parent === undefined ? 0n : parent.height + 1n;
-  const timestamp = (parent?.timestamp ?? 1_000n) + 1n;
+  const timestamp = changes.timestamp ?? (parent?.timestamp ?? 1_000n) + 1n;
   const target = changes.target ?? EASIEST;
   const postState = state(greeting);
   const cid = put({
@@ -153,8 +153,19 @@ function nodes(held: Record<string, Block[]>, path: readonly string[] = ["Nexus"
 const real = chain(30, "real");
 const genesis = real[0]!.cid;
 const at = (name: string) => `https://${name}.example.org`;
-const reader = (fetch: any, node: string | string[], more: object = {}) =>
-  connect({ chain: "Nexus/app", node, genesis, fetch, key: "11".repeat(32), ...more });
+const reader = (
+  fetch: any,
+  node: string | string[],
+  more: { checkpoint?: string; minAgree?: number; maxHeaders?: number } = {},
+) =>
+  connect({
+    chain: "Nexus/app",
+    node,
+    ...(more.checkpoint === undefined ? { genesis } : {}),
+    fetch,
+    key: "11".repeat(32),
+    ...more,
+  });
 
 test("a tip that links back to the app's genesis is read", async () => {
   const app = await reader(nodes({ a: real }).fetch, at("a"));
@@ -245,11 +256,92 @@ test("a longer fork one node made up is not read over what two nodes hold", asyn
   });
 });
 
-test("a node that cannot be reached is passed over", async () => {
+test("with one of two nodes unreachable, a read fails unless minAgree is 1", async () => {
   const { fetch } = nodes({ b: real });
   // The first node takes writes, so it must answer at connect; others need not.
-  const app = await reader(fetch, [at("b"), at("a")]);
+  const strict = await reader(fetch, [at("b"), at("a")]);
+  await assert.rejects(strict.get("greeting"), { name: "ReadError", code: "disagree" });
+  const lenient = await reader(fetch, [at("b"), at("a")], { minAgree: 1 });
+  assert.equal(await lenient.get("greeting"), "real/29");
+});
+
+test("one node given twice, in two spellings, counts once", async () => {
+  const { fetch, requests } = nodes({ a: real });
+  const app = await reader(fetch, [at("a"), "https://A.example.org:443/"]);
   assert.equal(await app.get("greeting"), "real/29");
+  assert.equal(requests.filter((r) => r.path === "/api/block/latest").length, 1);
+});
+
+test("what a page's storage says is never taken as linked", async () => {
+  // Another page on this origin plants a made-up tip as linked, with great work.
+  const forged = block(real.at(-1), "forged", { prevState: state("planted") });
+  const planted = JSON.stringify([{ cid: forged.cid, height: "30", work: String(2n ** 300n) }]);
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: { getItem: () => planted, setItem: () => {}, removeItem: () => {} },
+  });
+  try {
+    const app = await reader(nodes({ a: [...real, forged] }).fetch, at("a"));
+    await assert.rejects(app.get("greeting"), { name: "ReadError", code: "unanchored" });
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, "localStorage", descriptor);
+    else delete (globalThis as { localStorage?: unknown }).localStorage;
+  }
+});
+
+test("a block stamped hours ahead of this device is refused", async () => {
+  const ahead = block(real.at(-1), "ahead", { timestamp: BigInt(Date.now() + 3 * 3_600_000) });
+  const app = await reader(nodes({ a: [...real, ahead] }).fetch, at("a"));
+  await assert.rejects(app.get("greeting"), /2 hours ahead/);
+});
+
+test("a node whose Volumes fail is passed over for another that holds the tip", async () => {
+  const { fetch } = nodes({ a: real, b: real });
+  const failing = (input: string | URL) =>
+    new URL(String(input)).host.startsWith("a.") && String(input).includes("/volumes")
+      ? Promise.resolve(new Response("down", { status: 500 }))
+      : fetch(input);
+  const app = await reader(failing, [at("a"), at("b")]);
+  assert.equal(await app.get("greeting"), "real/29");
+});
+
+test("a block Volume over 32 KiB is not taken in a walk", async () => {
+  const { fetch } = nodes({ a: real });
+  const tip = real.at(-1)!;
+  const bloated = (input: string | URL) => {
+    const url = new URL(String(input));
+    if (url.pathname !== `/volumes/${tip.cid}`) return fetch(input);
+    const bytes = content.get(tip.cid)!;
+    const padding = encodeDagCbor({ padding: new Uint8Array(40_000) });
+    return Promise.resolve(
+      new Response(
+        encodeVolumeArchive({
+          rootCID: tip.cid,
+          entries: [
+            { cid: tip.cid, bytes },
+            { cid: cidV1DagCbor(padding), bytes: padding },
+          ],
+        }),
+        { headers: { "Content-Type": "application/vnd.lattice.volume" } },
+      ),
+    );
+  };
+  const app = await reader(bloated, at("a"));
+  await assert.rejects(app.get("greeting"), /exceeds/);
+});
+
+test("genesis and checkpoint together are refused: a walk ends at one", async () => {
+  await assert.rejects(
+    connect({
+      chain: "Nexus/app",
+      node: at("a"),
+      genesis,
+      checkpoint: real[25]!.cid,
+      fetch: nodes({ a: real }).fetch,
+    }),
+    RangeError,
+  );
 });
 
 test("on Nexus, every block walked must meet its proof-of-work target", async () => {

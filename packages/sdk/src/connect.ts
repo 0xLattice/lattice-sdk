@@ -1,4 +1,4 @@
-import { NodeClient, NodeError } from "@adalin/lattice-client";
+import { NodeClient, NodeError, normalizeNodeURL } from "@adalin/lattice-client";
 import {
   accountFromPrivateKey,
   bytesToHex,
@@ -29,7 +29,7 @@ import {
   type VerifiedVolume,
 } from "@adalin/lattice-volumes";
 import { findShares } from "./share-search.js";
-import { tipChooser, type Source } from "./tip.js";
+import { HEADER_VOLUME_BYTES, tipChooser, type Source } from "./tip.js";
 
 export { ReadError, type ReadFailure } from "./tip.js";
 
@@ -54,27 +54,37 @@ export interface ConnectOptions {
   /** The chain's path, as `Nexus/testnet/rsvp`. */
   readonly chain: string;
   /**
-   * A node's public read URL, or several run by different operators. The
-   * first must host the chain and take writes (public submit); all are read
-   * from. With one, that node chooses the tip reads are taken at. With
-   * several, a tip is read only once two of them hold it, and the heaviest
-   * such tip is read.
+   * A node's public read URL, or several, of different operators. The first
+   * must host the chain and take writes (public submit); all are read from.
+   * URLs are compared once normalized (case, trailing slash, default port),
+   * and a URL given twice counts once; two URLs of one operator still count
+   * as two, so give one URL per operator.
    */
   readonly node: string | readonly string[];
   /**
-   * The CID of the chain's genesis block, as the app ships it. Every tip
-   * read is then walked back to it (or to `checkpoint`, or to a block an
-   * earlier read linked) and refused unless each block links to the one
-   * before by the header rules. Without it, the tip is not checked against
-   * any history.
+   * How many of the nodes must hold a tip before it is read: by default 2
+   * when several are given (a read fails `disagree` when fewer agree, as when
+   * all but one are unreachable), 1 with one node, which then chooses the
+   * tip alone.
+   */
+  readonly minAgree?: number;
+  /**
+   * The CID of the chain's genesis block, as the app ships it: every tip read
+   * is walked back to it and refused unless each block links to the one
+   * before by the header rules (see the README). Without it or `checkpoint`,
+   * the tip is not checked against any history. Give one of the two.
    */
   readonly genesis?: string;
   /**
-   * The CID of a later block of the chain the app ships, to walk back to
-   * instead of genesis; reads must descend from it.
+   * The CID of a later block of the chain, as the app ships it, to walk back
+   * to instead of genesis: reads must descend from it. Ship a recent one
+   * with each release; a tip too far past it fails `tooFar`.
    */
   readonly checkpoint?: string;
-  /** The most blocks one read walks back before failing `tooFar`. Default: 2,000. */
+  /**
+   * The most blocks one read walks back, and 4 KiB of Volumes for each,
+   * before failing `tooFar`. Default: 2,000 (8 MiB).
+   */
   readonly maxHeaders?: number;
   /** lattice-sponsor URLs, tried in order, that pay fees for proof of work. */
   readonly sponsors?: readonly string[];
@@ -113,7 +123,7 @@ export interface Chain {
    * `checkpoint`, and no browser check makes a block's state honest: on a
    * chain whose blocks carry little work, any one node can make a block
    * that links to real history and holds any state. Several nodes guard
-   * against that: one alone cannot get its block read.
+   * against that: fewer than `minAgree` cannot get a block read.
    */
   get(key: string, options?: { readonly signal?: AbortSignal }): Promise<string | undefined>;
   /** The records whose keys start with `prefix`, in key order: at most `limit` (default 100). Read as `get` reads. */
@@ -385,9 +395,9 @@ function trie(volumes: VolumeClient, rootCID: string, signal?: AbortSignal) {
 /**
  * A chain to read and write, as a static page can. Reads are taken at a tip
  * block and checked by CID from that block down. With `genesis` (or
- * `checkpoint`) the tip must link back to it; with several nodes, two must
- * hold the tip. Otherwise reads are as honest as the one node's choice of
- * tip. Writes are signed by the visitor's key and paid for in proof of work
+ * `checkpoint`) the tip must link back to it by the header rules; with
+ * several nodes, `minAgree` of them (by default two) must hold it. Otherwise
+ * reads are as honest as the one node's choice of tip. Writes are signed by the visitor's key and paid for in proof of work
  * through a lattice-sponsor (or, with no sponsors, from the key's own
  * balance), one at a time.
  */
@@ -396,15 +406,29 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
   const fetch: Fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
   // A writer needs the tip as it is now, not as a cache kept it.
   const fresh: Fetch = (input, init) => fetch(input, { ...init, cache: "no-store" });
-  const urls = typeof options.node === "string" ? [options.node] : options.node;
+  const urls = [
+    ...new Set(
+      (typeof options.node === "string" ? [options.node] : options.node).map(normalizeNodeURL),
+    ),
+  ];
   if (urls.length === 0) throw new RangeError("node must name at least one node");
+  const minAgree = options.minAgree ?? Math.min(2, urls.length);
+  if (!Number.isSafeInteger(minAgree) || minAgree < 1 || minAgree > urls.length) {
+    throw new RangeError("minAgree must be from 1 to the number of nodes");
+  }
+  if (options.genesis !== undefined && options.checkpoint !== undefined) {
+    throw new RangeError("give genesis or checkpoint, not both: a walk ends at one");
+  }
   const sources: Source[] = urls.map((url) => {
     const node = new NodeClient(url, chainPath, { fetch: fresh });
     const transport = new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch });
     return {
       node,
       volumes: new VolumeClient(transport),
-      pages: new VolumeClient(new BatchingVolumeTransport(transport)),
+      headers: new VolumeClient(new BatchingVolumeTransport(transport), {
+        maximumEntries: 64,
+        maximumBytes: HEADER_VOLUME_BYTES,
+      }),
     };
   });
   const { node } = sources[0]!;
@@ -418,7 +442,7 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
     chainPath,
     ...(root === undefined ? {} : { root }),
     maxHeaders,
-    storageKey: `lattice-sdk/linked/${options.chain}/${root}`,
+    minAgree,
   });
   const submitter = new HTTPTransactionSubmitter(`${node.baseURL}/transactions`, { fetch });
   const sponsors = (options.sponsors ?? []).map((url) => new SponsorClient(url, { fetch }));
