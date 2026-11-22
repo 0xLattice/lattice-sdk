@@ -23,6 +23,7 @@ import {
   type SponsorWork,
 } from "@adalin/lattice-relay";
 import { HTTPVolumeTransport, VolumeClient, type VerifiedVolume } from "@adalin/lattice-volumes";
+import { readFile } from "./file.js";
 import { findShares } from "./share-search.js";
 
 type Fetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
@@ -103,6 +104,17 @@ export interface Chain {
     data: Uint8Array | Blob,
     options?: { readonly type?: string; readonly signal?: AbortSignal },
   ): Promise<string>;
+  /**
+   * The file `put` stored under `root`, read from the node's Volumes, with
+   * the type it was stored with. Its root and every chunk are checked
+   * against their CIDs, so a holder can fail to serve it but not serve
+   * other bytes. A file over `maxBytes` (default 64 MiB) is refused before
+   * any chunk is fetched.
+   */
+  getFile(
+    root: string,
+    options?: { readonly maxBytes?: number; readonly signal?: AbortSignal },
+  ): Promise<Blob>;
 }
 
 export type WriteFailure =
@@ -705,6 +717,13 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
     put(data, { type, signal } = {}) {
       const combined = signalFor(signal);
       return oneAtATime(combined, () => put(data, type, combined));
+    },
+
+    async getFile(root, { maxBytes = 64 << 20, signal } = {}) {
+      if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+        throw new RangeError("maxBytes must be a non-negative integer");
+      }
+      return readFile(volumes, root, maxBytes, signalFor(signal));
     },
   };
 }

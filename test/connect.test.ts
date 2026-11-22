@@ -715,3 +715,102 @@ test("an unsponsored write pays the node's fee floor as it is at the time", asyn
     ["-1", "-3"],
   );
 });
+
+/** A node that also serves `files`, Volumes of one block each, by CID. */
+function fileWorld(files: Map<string, Uint8Array>) {
+  const { fetch, requests } = world({
+    nodeRoute: ({ path }) => {
+      if (!path.startsWith("/volumes/")) return undefined;
+      const cid = decodeURIComponent(path.slice("/volumes/".length));
+      const bytes = files.get(cid);
+      if (bytes === undefined) return undefined;
+      return new Response(encodeVolumeArchive({ rootCID: cid, entries: [{ cid, bytes }] }), {
+        headers: { "Content-Type": "application/vnd.lattice.volume" },
+      });
+    },
+  });
+  return { fetch, requests };
+}
+
+/** Stores `value` as one block; its CID. */
+function stored(files: Map<string, Uint8Array>, value: DagCborValue) {
+  const bytes = encodeDagCbor(value);
+  const cid = cidV1DagCbor(bytes);
+  files.set(cid, bytes);
+  return cid;
+}
+
+test("a file put stored reads back whole, with its type", async () => {
+  // 2.5 MiB: two whole chunks and a part.
+  const data = new Uint8Array((5 << 20) / 2).map((_, i) => (i * 7) & 0xff);
+  const files = new Map<string, Uint8Array>();
+  const { fetch } = fileWorld(files);
+  let root = "";
+  const chain = await connect({
+    ...options(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/store") {
+        // The sponsor keeps what was uploaded, and the node serves it.
+        const upload = JSON.parse(String(init!.body));
+        root = upload.root;
+        for (const volume of upload.volumes) {
+          for (const [cid, base64] of Object.entries(volume.entries)) {
+            files.set(cid, new Uint8Array(Buffer.from(base64 as string, "base64")));
+          }
+        }
+        return json({ root, bytes: "0", needed: {}, credit: "0", stored: true });
+      }
+      return fetch(input, init);
+    }),
+  });
+  assert.equal(await chain.put(new Blob([data], { type: "image/png" })), root);
+  const file = await chain.getFile(root);
+  assert.equal(file.type, "image/png");
+  assert.deepEqual(new Uint8Array(await file.arrayBuffer()), data);
+});
+
+test("a small file stored as one block reads back", async () => {
+  const files = new Map<string, Uint8Array>();
+  const bytes = new TextEncoder().encode("hello");
+  const root = stored(files, { type: "text/plain", size: 5n, bytes });
+  const chain = await connect(options(fileWorld(files).fetch));
+  const file = await chain.getFile(root);
+  assert.equal(file.type, "text/plain");
+  assert.equal(await file.text(), "hello");
+});
+
+test("a file whose chunks do not add up to its size is refused", async () => {
+  const files = new Map<string, Uint8Array>();
+  const chunk = stored(files, { bytes: new Uint8Array(10) });
+  const short = stored(files, { type: "", size: 11n, chunks: [chunk] });
+  const missing = stored(files, { type: "", size: 10n, chunks: [] });
+  const extra = stored(files, { type: "", size: 10n, chunks: [chunk], name: "x" });
+  const chain = await connect(options(fileWorld(files).fetch));
+  await assert.rejects(chain.getFile(short), /chunk 0 .* is not 11 bytes/);
+  await assert.rejects(chain.getFile(missing), /chunks do not cover its size/);
+  await assert.rejects(chain.getFile(extra), /not \{ type, size, bytes \| chunks \}/);
+  // A block whose bytes are not its CID never reaches the reader.
+  files.set(chunk, encodeDagCbor({ bytes: new Uint8Array(10).fill(1) }));
+  const swapped = stored(files, { type: "", size: 10n, chunks: [chunk] });
+  await assert.rejects(chain.getFile(swapped));
+});
+
+test("a file over maxBytes is refused before any chunk is fetched", async () => {
+  const files = new Map<string, Uint8Array>();
+  const chunk = stored(files, { bytes: new Uint8Array(10) });
+  const root = stored(files, { type: "", size: 10n, chunks: [chunk] });
+  const { fetch, requests } = fileWorld(files);
+  const chain = await connect(options(fetch));
+  await assert.rejects(chain.getFile(root, { maxBytes: 9 }), RangeError);
+  assert.ok(!requests.some((r) => r.path === `/volumes/${chunk}`));
+  assert.equal((await chain.getFile(root, { maxBytes: 10 })).size, 10);
+});
+
+test("a file read stops when its signal aborts", async () => {
+  const files = new Map<string, Uint8Array>();
+  const root = stored(files, { type: "", size: 1n, bytes: new Uint8Array(1) });
+  const chain = await connect(options(fileWorld(files).fetch));
+  const stop = new AbortController();
+  stop.abort(new Error("stopped"));
+  await assert.rejects(chain.getFile(root, { signal: stop.signal }), /stopped/);
+});
