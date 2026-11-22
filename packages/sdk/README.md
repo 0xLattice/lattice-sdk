@@ -42,7 +42,13 @@ fee. Save this as an `.html` file and open it:
   const status = document.querySelector("#status");
   const chain = await connect({
     chain: "Nexus/testnet",
-    node: "https://lattice-testnet-apps-iad.fly.dev",
+    // A tip is read once two of these hold it. Give nodes of different
+    // operators: these two testnet nodes share one.
+    node: ["https://lattice-testnet-apps-iad.fly.dev", "https://ams.testnet.lattice.build"],
+    // A block of the chain this page ships (testnet 74,008): reads must
+    // descend from it. Stale once the chain is 2,000 blocks past it
+    // (maxHeaders); refresh it with each release (see below).
+    checkpoint: "bafyreib2btiyscwrh5ccy2ufxf7fh57gk6hjhxovlxx3awk6ssxinzggbq",
     sponsors: ["https://lattice-testnet-apps-iad.fly.dev:8650/sponsor"],
     onProgress: (p) => {
       if (p.stage === "work")
@@ -52,7 +58,7 @@ fee. Save this as an `.html` file and open it:
   });
   const key = `guestbook/${chain.address}`;
 
-  // A read at the node's tip block, checked by CID from that block down.
+  // A read at the tip, checked by CID from that block down.
   status.textContent = (await chain.get(key)) ?? "You have not signed yet.";
 
   // A write: paid for in proof of work, resolved once it is in a block.
@@ -67,13 +73,61 @@ fee. Save this as an `.html` file and open it:
 </script>
 ```
 
-- `await chain.get(key)` is the value at the tip block the node names, or
-  `undefined`. `await chain.list(prefix, { limit })` is `[{ key, value }]` in
-  key order (`limit` is a positive integer, 100 by default). Both check that
-  block, its state and every trie node against their CIDs, so the answer is
-  exactly that block's. **The node chooses the block**: reads are only as
-  honest as that choice, and a dishonest node can name a block of a chain it
-  made up. Use a node you trust, or compare tips across nodes.
+- `await chain.get(key)` is the value at the tip, or `undefined`.
+  `await chain.list(prefix, { limit })` is `[{ key, value }]` in key order
+  (`limit` is a positive integer, 100 by default). Both check the tip block,
+  its state and every trie node against their CIDs, so the answer is exactly
+  that block's. Which block is the tip is checked as follows:
+  - **`genesis` or `checkpoint`** (one of the two): the CID of the
+    chain's first block, or of a later one, shipped with the page. Every
+    tip is walked back until it meets that block, or a block an earlier
+    read on this page linked (kept in memory only: what a page's storage
+    says is never trusted). Each block must name its parent, be one higher,
+    start from its parent's post-state, keep its spec, be later than its
+    parent and no more than 2 hours ahead of this device's clock, and have
+    a target no easier than its parent's `nextTarget`; on Nexus, each must
+    also meet its proof-of-work target. A tip that does not link fails with
+    `ReadError` code `unanchored`.
+  - **Bounds.** A walk stops after `maxHeaders` blocks (default 2,000), or
+    after fetching 4 KiB a block on average (8 MiB by default); either
+    fails `tooFar`. One block's Volume may be at most 32 KiB. Blocks are
+    fetched in pages of 25 while the node's own chain lists them, one at a
+    time after a page misses. A block is about 1–2.5 KB, so a typical walk
+    of 1,000 blocks fetches about 2.5 MB in about 90 requests.
+  - **Keeping a checkpoint fresh.** A chain moves past a checkpoint by
+    `maxHeaders` blocks in `maxHeaders` × its block time: about a day and a
+    half at one block a minute. Each page load walks from the checkpoint
+    again, so ship a recent one with every release, read at release time
+    from a node you run:
+    `curl -s "https://your-node/api/block/latest?chainPath=Nexus/testnet" | jq -r .hash`.
+    A page that cannot be re-released can pin `genesis` with a larger
+    `maxHeaders`, at about 2.5 KB a block per page load.
+  - **Several `node`s**: a tip is read only once `minAgree` of them
+    (default 2) hold it, as their tip or at its height on their chain;
+    fewer, even because the others are down, fails `disagree` (pass
+    `minAgree: 1` to read from whichever answers). URLs are compared
+    normalized (case, trailing slash, default port), but two URLs of one
+    operator still count as two. Of the tips that agree and link, the
+    heaviest is read: the sum of `workForTarget` of each block's **stated**
+    target above the pinned block (checked against proof of work only on
+    Nexus), or the highest without a pin; equal ones by smaller CID. If a
+    node's Volumes fail, time out (15 s a request) or overrun the walk's
+    bounds, the tip and its state are read through another node that holds
+    it. Without a pin, a Nexus tip must still meet its proof-of-work target.
+  - **What that does not cover.** The SDK does not run the chain's rules,
+    so it cannot tell a block's state was honestly reached: a block that
+    links is not a block whose state is right. Targets are checked only
+    against the parent's stated `nextTarget`, which the SDK does not
+    recompute (that needs the chain's ASERT schedule), so on Nexus only
+    the first forged block on real history pays real proof of work; the
+    forger can schedule the rest at any target. On a child chain, a
+    block's work is in proofs the HTTP API does not serve, so no work is
+    checked. On a chain whose blocks take about one hash (as hosts make
+    them), one node can make a block that links to real history and holds
+    any state. Against that, only nodes of different operators help: with
+    one node, reads are as honest as that node; with several, as honest as
+    any `minAgree` of them. A node can always serve an older tip. Without
+    `genesis` or `checkpoint`, a tip is not checked against any history.
 - `await chain.set(key, value)` writes a string value and resolves with
   `{ transactionCID }` once the node shows the write in a block. The write
   states the value it replaces, as the chain requires. Writes and uploads
@@ -85,8 +139,9 @@ fee. Save this as an `.html` file and open it:
   1 MiB chunks; `type` is at most 255 characters. Version 0.2.0 chunked
   small files too, so a small file stored now has a different root CID
   than the same file stored by it; both read with `getFile`.
-- `await chain.getFile(root, { maxBytes })` reads that file back from the
-  node as a `Blob` with the type it was stored with. The root and every
+- `await chain.getFile(root, { maxBytes })` reads that file back as a
+  `Blob` with the type it was stored with, from the nodes that hold the
+  tip, each in turn until one serves it. The root and every
   1 MiB chunk are checked against their CIDs, their place and their length,
   so a holder can fail to serve a file but cannot serve other bytes. A file
   over `maxBytes` (default 64 MiB) is refused before any chunk is fetched,
@@ -116,6 +171,7 @@ fee. Save this as an `.html` file and open it:
     keep the origin free of third-party script, or pass your own `key`.
   - `maxFee` (default `10`): the most an unsponsored write pays.
   - `confirmTimeoutMilliseconds` (default 15 minutes).
+  - `genesis`, `checkpoint`, `maxHeaders`, `minAgree`: see reads, above.
   - `signal`: an `AbortSignal` that stops every call; `get`, `list`, `set`,
     `put` and `getFile` also take `{ signal }`.
   - `workers`: Web Workers to grind in; by default all cores but one, `0`
@@ -123,7 +179,7 @@ fee. Save this as an `.html` file and open it:
   - `onProgress`: hears `work` (with `hashes`, `shares` and
     `sharesNeeded`), `submit`, `confirm` and `store`.
 
-The node must host the chain and accept writes on its public listener
+The first `node` must host the chain and accept writes on its public listener
 (`--public-submit`; `GET /api/chain/info` says `acceptsSubmit`).
 
 A share at the sponsor's default `--share-work` of 2^24 hashes takes about 1 s

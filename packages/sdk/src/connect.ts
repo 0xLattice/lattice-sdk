@@ -1,4 +1,4 @@
-import { LatticeClient, NodeClient, NodeError } from "@adalin/lattice-client";
+import { NodeClient, NodeError, normalizeNodeURL } from "@adalin/lattice-client";
 import {
   accountFromPrivateKey,
   bytesToHex,
@@ -22,9 +22,17 @@ import {
   type StoreVolume,
   type SponsorWork,
 } from "@adalin/lattice-relay";
-import { HTTPVolumeTransport, VolumeClient, type VerifiedVolume } from "@adalin/lattice-volumes";
+import {
+  BatchingVolumeTransport,
+  HTTPVolumeTransport,
+  VolumeClient,
+  type VerifiedVolume,
+} from "@adalin/lattice-volumes";
 import { FILE_VOLUME_LIMITS, readFile } from "./file.js";
 import { findShares } from "./share-search.js";
+import { HEADER_VOLUME_BYTES, tipChooser, type Source } from "./tip.js";
+
+export { ReadError, type ReadFailure } from "./tip.js";
 
 type Fetch = (input: string | URL, init?: RequestInit) => Promise<Response>;
 type Payload = ReturnType<typeof transactionPayload>;
@@ -47,10 +55,38 @@ export interface ConnectOptions {
   /** The chain's path, as `Nexus/testnet/rsvp`. */
   readonly chain: string;
   /**
-   * A node's public read URL; it must host the chain, and take writes
-   * (public submit). This node chooses the tip that reads are taken at.
+   * A node's public read URL, or several, of different operators. The first
+   * must host the chain and take writes (public submit); all are read from.
+   * URLs are compared once normalized (case, trailing slash, default port),
+   * and a URL given twice counts once; two URLs of one operator still count
+   * as two, so give one URL per operator.
    */
-  readonly node: string;
+  readonly node: string | readonly string[];
+  /**
+   * How many of the nodes must hold a tip before it is read: by default 2
+   * when several are given (a read fails `disagree` when fewer agree, as when
+   * all but one are unreachable), 1 with one node, which then chooses the
+   * tip alone.
+   */
+  readonly minAgree?: number;
+  /**
+   * The CID of the chain's genesis block, as the app ships it: every tip read
+   * is walked back to it and refused unless each block links to the one
+   * before by the header rules (see the README). Without it or `checkpoint`,
+   * the tip is not checked against any history. Give one of the two.
+   */
+  readonly genesis?: string;
+  /**
+   * The CID of a later block of the chain, as the app ships it, to walk back
+   * to instead of genesis: reads must descend from it. Ship a recent one
+   * with each release; a tip too far past it fails `tooFar`.
+   */
+  readonly checkpoint?: string;
+  /**
+   * The most blocks one read walks back, and 4 KiB of Volumes for each,
+   * before failing `tooFar`. Default: 2,000 (8 MiB).
+   */
+  readonly maxHeaders?: number;
   /** lattice-sponsor URLs, tried in order, that pay fees for proof of work. */
   readonly sponsors?: readonly string[];
   /**
@@ -82,10 +118,13 @@ export interface Chain {
   /** The writer's address. */
   readonly address: string;
   /**
-   * The value under `key` at the tip the node names. The block, its state
+   * The value under `key` at the tip (see `connect`). The block, its state
    * and every trie node are checked against their CIDs, so the answer is
-   * that block's; but the node chooses the block, and a dishonest node can
-   * name a block of a chain it made up.
+   * that block's. The tip's history is checked only with `genesis` or
+   * `checkpoint`, and no browser check makes a block's state honest: on a
+   * chain whose blocks carry little work, any one node can make a block
+   * that links to real history and holds any state. Several nodes guard
+   * against that: fewer than `minAgree` cannot get a block read.
    */
   get(key: string, options?: { readonly signal?: AbortSignal }): Promise<string | undefined>;
   /** The records whose keys start with `prefix`, in key order: at most `limit` (default 100). Read as `get` reads. */
@@ -368,24 +407,61 @@ function trie(volumes: VolumeClient, rootCID: string, signal?: AbortSignal) {
 }
 
 /**
- * A chain to read and write, as a static page can. Reads are taken at the
- * tip block the node names and checked by CID from that block down: they
- * are as honest as the node's choice of tip. Writes are signed by the
- * visitor's key and paid for in proof of work through a lattice-sponsor (or,
- * with no sponsors, from the key's own balance), one at a time.
+ * A chain to read and write, as a static page can. Reads are taken at a tip
+ * block and checked by CID from that block down. With `genesis` (or
+ * `checkpoint`) the tip must link back to it by the header rules; with
+ * several nodes, `minAgree` of them (by default two) must hold it. Otherwise
+ * reads are as honest as the one node's choice of tip. Writes are signed by the visitor's key and paid for in proof of work
+ * through a lattice-sponsor (or, with no sponsors, from the key's own
+ * balance), one at a time.
  */
 export async function connect(options: ConnectOptions): Promise<Chain> {
   const chainPath = options.chain.split("/");
   const fetch: Fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
   // A writer needs the tip as it is now, not as a cache kept it.
   const fresh: Fetch = (input, init) => fetch(input, { ...init, cache: "no-store" });
-  const node = new NodeClient(options.node, chainPath, { fetch: fresh });
-  const volumes = new VolumeClient(new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch }));
-  const lattice = new LatticeClient(node, volumes);
-  const files = new VolumeClient(
-    new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch, limits: FILE_VOLUME_LIMITS }),
-    FILE_VOLUME_LIMITS,
-  );
+  const urls = [
+    ...new Set(
+      (typeof options.node === "string" ? [options.node] : options.node).map(normalizeNodeURL),
+    ),
+  ];
+  if (urls.length === 0) throw new RangeError("node must name at least one node");
+  const minAgree = options.minAgree ?? Math.min(2, urls.length);
+  if (!Number.isSafeInteger(minAgree) || minAgree < 1 || minAgree > urls.length) {
+    throw new RangeError("minAgree must be from 1 to the number of nodes");
+  }
+  if (options.genesis !== undefined && options.checkpoint !== undefined) {
+    throw new RangeError("give genesis or checkpoint, not both: a walk ends at one");
+  }
+  const sources: Source[] = urls.map((url) => {
+    const node = new NodeClient(url, chainPath, { fetch: fresh });
+    const transport = new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch });
+    return {
+      node,
+      volumes: new VolumeClient(transport),
+      headers: new VolumeClient(new BatchingVolumeTransport(transport), {
+        maximumEntries: 64,
+        maximumBytes: HEADER_VOLUME_BYTES,
+      }),
+      files: new VolumeClient(
+        new HTTPVolumeTransport(`${node.baseURL}/volumes`, { fetch, limits: FILE_VOLUME_LIMITS }),
+        FILE_VOLUME_LIMITS,
+      ),
+    };
+  });
+  const { node } = sources[0]!;
+  const maxHeaders = options.maxHeaders ?? 2_000;
+  if (!Number.isSafeInteger(maxHeaders) || maxHeaders < 1) {
+    throw new RangeError("maxHeaders must be a positive integer");
+  }
+  const root = options.checkpoint ?? options.genesis;
+  const chooseTip = tipChooser({
+    sources,
+    chainPath,
+    ...(root === undefined ? {} : { root }),
+    maxHeaders,
+    minAgree,
+  });
   const submitter = new HTTPTransactionSubmitter(`${node.baseURL}/transactions`, { fetch });
   const sponsors = (options.sponsors ?? []).map((url) => new SponsorClient(url, { fetch }));
   const privateKey =
@@ -420,10 +496,28 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
   // The node must host the chain.
   await node.chainInfo(options.signal);
 
-  async function state(signal?: AbortSignal) {
-    const latest = await lattice.latestBlock(signal);
-    const post = await volumes.get(latest.canonical.postStateCID, signal);
-    return trie(volumes, decodeCanonicalLatticeState(post.rootBytes()).generalStateCID, signal);
+  /**
+   * `read` of the general state at the tip, through each node that holds
+   * it in turn until one answers: one node down or slow (each request has
+   * its timeout) does not fail the read.
+   */
+  async function atTip<T>(
+    read: (reads: ReturnType<typeof trie>) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const tip = await chooseTip(signal);
+    let failure: unknown;
+    for (const { volumes } of tip.holders) {
+      try {
+        const post = await volumes.get(tip.block.postStateCID, signal);
+        const general = decodeCanonicalLatticeState(post.rootBytes()).generalStateCID;
+        return await read(trie(volumes, general, signal));
+      } catch (error) {
+        signal?.throwIfAborted();
+        failure = error;
+      }
+    }
+    throw failure;
   }
 
   async function nextNonce(signal?: AbortSignal): Promise<{ nonce: bigint; balance: bigint }> {
@@ -613,7 +707,7 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
 
   async function set(key: string, value: string, signal?: AbortSignal) {
     const [old, { nonce, balance }] = await Promise.all([
-      state(signal).then((reads) => reads.get(key)),
+      atTip((reads) => reads.get(key), signal),
       nextNonce(signal),
     ]);
     // The chain checks the value being replaced: a write states it.
@@ -705,14 +799,14 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
     address: account.address,
 
     async get(key, { signal } = {}) {
-      return (await state(signalFor(signal))).get(key);
+      return atTip((reads) => reads.get(key), signalFor(signal));
     },
 
     async list(prefix = "", { limit = 100, signal } = {}) {
       if (!Number.isSafeInteger(limit) || limit < 1) {
         throw new RangeError("limit must be a positive integer");
       }
-      return (await state(signalFor(signal))).list(prefix, limit);
+      return atTip((reads) => reads.list(prefix, limit), signalFor(signal));
     },
 
     set(key, value, { signal } = {}) {
@@ -729,7 +823,20 @@ export async function connect(options: ConnectOptions): Promise<Chain> {
       if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
         throw new RangeError("maxBytes must be a non-negative integer");
       }
-      return readFile(files, root, maxBytes, signalFor(signal));
+      const combined = signalFor(signal);
+      // Read from the nodes that hold the tip, each in turn until one serves it.
+      const { holders } = await chooseTip(combined);
+      let failure: unknown;
+      for (const holder of holders) {
+        try {
+          return await readFile(holder.files, root, maxBytes, combined);
+        } catch (error) {
+          if (error instanceof RangeError) throw error;
+          combined?.throwIfAborted();
+          failure = error;
+        }
+      }
+      throw failure;
     },
   };
 }
