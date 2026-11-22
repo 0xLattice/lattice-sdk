@@ -82,7 +82,9 @@ fee. Save this as an `.html` file and open it:
   storage (`--sell-storage`) and resolves to its root CID. Files are laid out
   as [lattice-storage](https://github.com/0xLattice/lattice-storage) reads
   them: one block `{ type, size, bytes }` up to 1 MiB, else a root naming
-  1 MiB chunks; `type` is at most 255 characters. Version 0.2.0 chunked small files too, so a small file stored now has a different root CID than the same file stored by it; both read with `getFile`.
+  1 MiB chunks; `type` is at most 255 characters. Version 0.2.0 chunked
+  small files too, so a small file stored now has a different root CID
+  than the same file stored by it; both read with `getFile`.
 - `await chain.getFile(root, { maxBytes })` reads that file back from the
   node as a `Blob` with the type it was stored with. The root and every
   1 MiB chunk are checked against their CIDs, their place and their length,
