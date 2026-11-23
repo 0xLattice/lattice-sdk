@@ -17,7 +17,6 @@ export interface NodeStatus {
   readonly nexusGenesisCID: string;
   readonly tipCID?: string;
   readonly height?: bigint;
-  readonly revision?: bigint;
   readonly mempoolCount: number;
   readonly mempoolBytes: number;
   readonly templateDigest?: string;
@@ -37,7 +36,6 @@ export function parseNodeStatus(value: unknown): NodeStatus {
     nexusGenesisCID: string(body.nexusGenesisCID, "status.nexusGenesisCID"),
     ...(body.tipCID === undefined ? {} : { tipCID: string(body.tipCID, "status.tipCID") }),
     ...(body.height === undefined ? {} : { height: decimal(body.height, "status.height") }),
-    ...(body.revision === undefined ? {} : { revision: decimal(body.revision, "status.revision") }),
     mempoolCount: integer(body.mempoolCount, "status.mempoolCount"),
     mempoolBytes: integer(body.mempoolBytes, "status.mempoolBytes"),
     ...(body.templateDigest === undefined
