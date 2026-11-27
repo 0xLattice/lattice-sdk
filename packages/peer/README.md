@@ -1,17 +1,40 @@
 # @adalin/lattice-peer
 
 Follow one Lattice chain as an overlay peer, from a browser or Node.js, and
-check every header you are sent.
+check every header you are sent. This is the only part of the SDK that
+checks a child chain's proof of work.
+
+## Install
+
+The release workflow does not publish this package to npm. Build it from
+the [lattice-sdk repository](https://github.com/0xLattice/lattice-sdk):
+
+```sh
+git clone https://github.com/0xLattice/lattice-sdk
+cd lattice-sdk
+npm install
+npm run build
+```
+
+It needs an Ivy node to carry its messages: Ivy's TypeScript shell, which
+for a browser runs Ivy's WebAssembly core over `wss://<node>/ivy`.
+
+## Following a chain
 
 `ChainFollower` speaks the node's sync messages over an authenticated Ivy
-session (for a browser: Ivy's WebAssembly core over `wss://<node>/ivy`). It
+session. It
 asks the node for its log's tail (nodes that name `stream-tail` in their
 hello; older nodes are paged), is pushed what the node weighs next, fetches
 each header, and reports the heaviest one whose bytes hash to its CID and
 whose proof of work verifies: a child chain's through its `ChildBlockProof`
 (`verifyChildBlockProof` in `@adalin/lattice-core`), Nexus's on its own.
 
+A fragment: it assumes `ivy`, an Ivy node, `session`, an open session to a
+Lattice node, and `nexusGenesisCID`, the genesis of the network you follow.
+
 ```ts
+import { ChainFollower } from "@adalin/lattice-peer";
+
 const follower = new ChainFollower({
   chainPath: ["Nexus", "moniker"],
   nexusGenesisCID,
@@ -21,19 +44,22 @@ const follower = new ChainFollower({
 // Ivy delegate: peerConnected → follower.open(); deliver → follower.deliver(topic, payload)
 ```
 
-The assurance is work, not validity: the follower does not execute blocks
-or check a block's target against its chain's schedule, so a miner may pick
-an easy target and a header can cost little.
+## What the follower assures
 
-The node it connects to picks where it starts: the first header the
-follower takes (the node's tip) and that block's 64 ancestors are the
-window every branch is weighed in. A branch that does not connect to a
-block in the window is dropped; the follower cannot reorg below it. The
-node also controls liveness: it can withhold what it has. As it holds more
-than `keep` blocks (4,096), the lightest are let go, which raises the
-window's floor. So the tip it reports is the heaviest branch connected
-within the window, among the headers that one node sent, each of which hashes to its CID and carries
-the work it claims.
+The tip it reports is the heaviest branch connected within its window,
+among the headers that one node sent, each of which hashes to its CID and
+carries the work it claims.
+
+- **Work, not validity.** The follower does not execute blocks or check a
+  block's target against its chain's schedule, so a miner may pick an easy
+  target and a header can cost little.
+- **The node picks where it starts.** The first header the follower takes
+  (the node's tip) and that block's 64 ancestors are the window every branch
+  is weighed in. A branch that does not connect to a block in the window is
+  dropped; the follower cannot reorg below it.
+- **The node controls liveness.** It can withhold what it has.
+- **The window's floor rises.** As the follower holds more than `keep`
+  blocks (4,096), the lightest are let go.
 
 ## Finding a chain's hosts
 
@@ -50,7 +76,11 @@ keep the entry session open by following Nexus on it while the lookup runs
 (every node hosts Nexus). Route each delivered message to the follower of
 the session it came from.
 
+A fragment: it assumes `ivy`, an Ivy node, `entryEndpoint`, the
+`PeerEndpoint` of a node you know, and `nexusGenesisCID`.
+
 ```ts
+import { ChainFollower, connectToChainHost } from "@adalin/lattice-peer";
 import { connectWebSocket } from "ivy"; // Ivy's TypeScript shell
 const followers = new Map<string, ChainFollower>(); // by session key
 const follow = (peer: string, chainPath: string[]) => {
@@ -79,3 +109,12 @@ const host = await connectToChainHost({
 if (host === undefined) throw new Error("no host of Nexus/moniker reachable");
 follow(host, ["Nexus", "moniker"]);
 ```
+
+## Documentation
+
+- [API reference](https://github.com/0xLattice/lattice-sdk/blob/main/docs/api.md#adalinlattice-peer):
+  every export.
+- [What `connect` does not check](https://github.com/0xLattice/lattice-sdk/blob/main/docs/connect.md#what-a-read-does-not-cover),
+  and why a child chain's work needs this package.
+
+MIT
